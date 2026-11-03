@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TrustVault</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body class="auth-page">
+  <main class="auth-shell">
+    <section class="panel auth-panel">
+      <div class="brand-row">
+        <div class="brand-mark">T</div>
+        <div>
+          <h1>TrustVault</h1>
+          <p>Secure document sharing</p>
+        </div>
+      </div>
+
+      <div class="tab-bar">
+        <button class="tab-btn active" data-mode="login" type="button">Login</button>
+        <button class="tab-btn" data-mode="register" type="button">Register</button>
+      </div>
+
+      <form id="loginForm" class="auth-form">
+        <label>
+          Email
+          <input type="email" name="email" placeholder="name@example.com" required />
+        </label>
+        <label>
+          Password
+          <input type="password" name="password" placeholder="••••••••" required />
+        </label>
+        <button type="submit" class="primary-btn">Sign in</button>
+      </form>
+
+      <form id="registerForm" class="auth-form hidden">
+        <label>
+          Full name
+          <input type="text" name="name" placeholder="Jane Doe" required />
+        </label>
+        <label>
+          Email
+          <input type="email" name="email" placeholder="name@example.com" required />
+        </label>
+        <label>
+          Password
+          <input type="password" name="password" placeholder="At least 8 characters" required />
+        </label>
+        <button type="submit" class="primary-btn">Create account</button>
+      </form>
+
+      <div id="authMessage" class="status-message" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>
