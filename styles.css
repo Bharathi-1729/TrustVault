@@ -1,3 +1,4 @@
+
 :root {
   --bg: #f1f5f9;
   --panel: #ffffff;
@@ -16,7 +17,8 @@
   box-sizing: border-box;
 }
 
-html, body {
+html,
+body {
   margin: 0;
   min-height: 100%;
   font-family: Arial, sans-serif;
@@ -39,6 +41,7 @@ body {
 }
 
 .panel {
+  min-width: 0;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 16px;
@@ -65,7 +68,9 @@ body {
   font-size: 28px;
 }
 
-h1, h2, p {
+h1,
+h2,
+p {
   margin: 0;
 }
 
@@ -89,7 +94,9 @@ p {
   margin-bottom: 24px;
 }
 
-.tab-btn, .primary-btn, .secondary-btn {
+.tab-btn,
+.primary-btn,
+.secondary-btn {
   border: 0;
   border-radius: 10px;
   font-weight: 600;
@@ -108,7 +115,8 @@ p {
   color: #fff;
 }
 
-.primary-btn, .secondary-btn {
+.primary-btn,
+.secondary-btn {
   padding: 12px 16px;
 }
 
@@ -124,6 +132,14 @@ p {
 
 button:hover {
   transform: translateY(-1px);
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 .auth-form,
@@ -143,12 +159,18 @@ label {
   color: var(--text);
 }
 
-input, textarea, select, button {
+input,
+textarea,
+select,
+button {
   font: inherit;
 }
 
-input, textarea, select {
+input,
+textarea,
+select {
   width: 100%;
+  min-width: 0;
   border: 1px solid var(--border);
   background: #f9fbff;
   border-radius: 10px;
@@ -179,10 +201,15 @@ textarea {
   color: var(--success);
 }
 
+/* =========================
+   TOP NAVIGATION
+========================= */
+
 .topbar {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 16px;
   padding: 16px 20px;
   background: #fff;
   border-bottom: 1px solid var(--border);
@@ -195,6 +222,7 @@ textarea {
   display: flex;
   gap: 12px;
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .user-badge {
@@ -203,13 +231,27 @@ textarea {
   background: var(--panel-alt);
   color: var(--primary);
   font-weight: 700;
+  overflow-wrap: anywhere;
 }
 
+/* =========================
+   DASHBOARD LAYOUT
+========================= */
+
 .dashboard-grid {
+  width: 100%;
   padding: 20px;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: repeat(
+    auto-fit,
+    minmax(min(100%, 320px), 1fr)
+  );
   gap: 18px;
+  align-items: stretch;
+}
+
+.dashboard-grid > * {
+  min-width: 0;
 }
 
 .wide-panel {
@@ -223,6 +265,7 @@ textarea {
 }
 
 .stat-card {
+  min-width: 0;
   background: var(--panel-alt);
   border-radius: 12px;
   padding: 16px;
@@ -237,6 +280,7 @@ textarea {
 
 .stat-card strong {
   font-size: 1.7rem;
+  overflow-wrap: anywhere;
 }
 
 .panel-header-row {
@@ -252,15 +296,25 @@ textarea {
   align-items: center;
   gap: 10px;
   font-weight: 600;
+  flex-wrap: wrap;
 }
 
-.document-list, .admin-list, .audit-list {
+/* =========================
+   DOCUMENTS
+========================= */
+
+.document-list,
+.admin-list,
+.audit-list {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-width: 0;
+  width: 100%;
 }
 
 .document-item {
+  min-width: 0;
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 16px;
@@ -270,8 +324,14 @@ textarea {
 .document-header {
   display: flex;
   justify-content: space-between;
+  align-items: flex-start;
   gap: 14px;
   flex-wrap: wrap;
+}
+
+.document-header > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .document-actions {
@@ -294,27 +354,187 @@ textarea {
   color: var(--muted);
   font-size: 0.86rem;
   margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+/* =========================
+   ADMINISTRATIVE CONTROLS
+========================= */
+
+.admin-list {
+  gap: 14px;
+  align-items: stretch;
 }
 
 .admin-row {
-  display: flex;
-  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 10px;
+  gap: 14px;
   border: 1px solid var(--border);
   border-radius: 12px;
-  padding: 12px 14px;
+  padding: 14px;
+  background: #fff;
+}
+
+/* User name and email */
+
+.admin-row > div:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.admin-row strong {
+  display: block;
+  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+}
+
+.admin-row p,
+.admin-row span {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Admin action buttons */
+
+.admin-row > div:last-child {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.admin-row button {
+  max-width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 9px;
+  background: #edf3ff;
+  color: var(--text);
+  cursor: pointer;
+  white-space: normal;
+}
+
+/* If buttons are direct children */
+
+.admin-row > button {
+  justify-self: end;
+}
+
+/* =========================
+   AUDIT / EVENT LOG
+========================= */
+
+.audit-list {
+  gap: 10px;
 }
 
 .audit-entry {
+  width: 100%;
+  min-width: 0;
   border: 1px solid var(--border);
   border-radius: 12px;
-  padding: 12px 14px;
+  padding: 14px;
   background: #f9fbff;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.audit-entry strong {
+  display: block;
+  margin-bottom: 5px;
+}
+
+.audit-entry p,
+.audit-entry span,
+.audit-entry small {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* =========================
+   RESPONSIVE DESIGN
+========================= */
+
+@media (max-width: 900px) {
+  .dashboard-grid {
+    grid-template-columns: repeat(
+      auto-fit,
+      minmax(min(100%, 300px), 1fr)
+    );
+  }
 }
 
 @media (max-width: 640px) {
   .topbar {
-    flex-wrap: wrap;
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 14px;
+  }
+
+  .topbar-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .dashboard-grid {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 12px;
+    gap: 14px;
+  }
+
+  .panel {
+    padding: 16px;
+  }
+
+  .panel-header-row {
+    align-items: flex-start;
+  }
+
+  .admin-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .admin-row > div:last-child {
+    justify-content: flex-start;
+  }
+
+  .admin-row > button {
+    justify-self: start;
+  }
+
+  .page-controls {
+    width: 100%;
+  }
+
+  .user-badge {
+    max-width: 100%;
+  }
+}
+
+@media (max-width: 380px) {
+  .auth-page {
+    padding: 12px;
+  }
+
+  .panel {
+    padding: 14px;
+  }
+
+  .admin-row button {
+    padding: 8px 10px;
+    font-size: 0.9rem;
+  }
+
+  h1 {
+    font-size: 1.6rem;
   }
 }
