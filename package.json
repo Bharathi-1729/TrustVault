@@ -1,0 +1,29 @@
+{
+  "name": "trustvault",
+  "version": "1.0.0",
+  "description": "TrustVault secure document sharing platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "security",
+    "documents",
+    "express",
+    "sqlite"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.5.0",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.4.1",
+    "express-session": "^1.18.1",
+    "file-type": "^19.0.0",
+    "helmet": "^8.0.0",
+    "multer": "^1.4.5-lts.1",
+    "uuid": "^11.0.0"
+  }
+}
