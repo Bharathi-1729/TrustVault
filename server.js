@@ -32,6 +32,7 @@ const {
 const {
   MAX_FILE_SIZE_BYTES,
   ALLOWED_EXTENSIONS,
+  ALLOWED_MIME_TYPES,
   sanitizeFilename,
   normalizePermission,
   isAllowedRole,
@@ -40,24 +41,90 @@ const {
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
-const privateUploadDir = path.join(__dirname, 'private_uploads');
+const privateUploadDir = process.env.TRUSTVAULT_UPLOAD_DIR || path.join(__dirname, 'private_uploads');
 fs.mkdirSync(privateUploadDir, { recursive: true });
 const staticDir = __dirname;
 
 initializeDatabase();
 
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 
+class SQLiteSessionStore extends session.Store {
+  constructor(database) {
+    super();
+    this.database = database;
+  }
+
+  get(sessionId, callback) {
+    try {
+      const row = this.database.prepare(
+        'SELECT sess, expires FROM sessions WHERE sid = ?'
+      ).get(sessionId);
+      if (!row) return callback(null, null);
+      if (row.expires <= Date.now()) {
+        this.database.prepare('DELETE FROM sessions WHERE sid = ?').run(sessionId);
+        return callback(null, null);
+      }
+      return callback(null, JSON.parse(row.sess));
+    } catch (error) {
+      return callback(error);
+    }
+  }
+
+  set(sessionId, sessionData, callback) {
+    try {
+      const cookie = sessionData.cookie || {};
+      const expiresAt = cookie.expires
+        ? new Date(cookie.expires).getTime()
+        : Date.now() + (Number(cookie.maxAge) || 24 * 60 * 60 * 1000);
+
+      this.database.prepare(`
+        INSERT INTO sessions(sid, sess, expires) VALUES(?, ?, ?)
+        ON CONFLICT(sid) DO UPDATE SET sess = excluded.sess, expires = excluded.expires
+      `).run(sessionId, JSON.stringify(sessionData), expiresAt);
+      this.database.prepare('DELETE FROM sessions WHERE expires <= ?').run(Date.now());
+      if (callback) callback(null);
+    } catch (error) {
+      if (callback) callback(error);
+    }
+  }
+
+  touch(sessionId, sessionData, callback) {
+    try {
+      const cookie = sessionData.cookie || {};
+      const expiresAt = cookie.expires
+        ? new Date(cookie.expires).getTime()
+        : Date.now() + (Number(cookie.maxAge) || 24 * 60 * 60 * 1000);
+      this.database.prepare('UPDATE sessions SET expires = ? WHERE sid = ?')
+        .run(expiresAt, sessionId);
+      if (callback) callback(null);
+    } catch (error) {
+      if (callback) callback(error);
+    }
+  }
+
+  destroy(sessionId, callback) {
+    try {
+      this.database.prepare('DELETE FROM sessions WHERE sid = ?').run(sessionId);
+      if (callback) callback(null);
+    } catch (error) {
+      if (callback) callback(error);
+    }
+  }
+}
+
 app.use(session({
   secret: process.env.TRUSTVAULT_SESSION_SECRET || 'trustvault-dev-secret',
+  store: new SQLiteSessionStore(db),
   resave: false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
-    secure: false,
+    secure: process.env.NODE_ENV === 'production',
     maxAge: 1000 * 60 * 60 * 8
   }
 }));
@@ -82,6 +149,14 @@ function getSessionUser(req) {
   const userId = req.session && req.session.userId;
   if (!userId) return null;
   return getUserById(userId);
+}
+
+function startUserSession(req, userId, callback) {
+  req.session.regenerate((error) => {
+    if (error) return callback(error);
+    req.session.userId = userId;
+    req.session.save(callback);
+  });
 }
 
 function requireAuth(req, res, next) {
@@ -201,6 +276,39 @@ const upload = multer({
   }
 });
 
+function zipContainsEntries(buffer, requiredEntries) {
+  const directoryEndMin = Math.max(0, buffer.length - 22 - 0xffff);
+  let endOffset = -1;
+
+  for (let offset = buffer.length - 22; offset >= directoryEndMin; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50) {
+      endOffset = offset;
+      break;
+    }
+  }
+  if (endOffset < 0) return false;
+
+  const entryCount = buffer.readUInt16LE(endOffset + 10);
+  const directoryOffset = buffer.readUInt32LE(endOffset + 16);
+  if (entryCount === 0xffff || directoryOffset === 0xffffffff) return false;
+
+  const names = new Set();
+  let offset = directoryOffset;
+  for (let index = 0; index < entryCount; index += 1) {
+    if (offset + 46 > buffer.length || buffer.readUInt32LE(offset) !== 0x02014b50) return false;
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const entryEnd = offset + 46 + nameLength + extraLength + commentLength;
+    if (entryEnd > buffer.length) return false;
+
+    names.add(buffer.toString('utf8', offset + 46, offset + 46 + nameLength));
+    offset = entryEnd;
+  }
+
+  return requiredEntries.every((name) => names.has(name));
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, name: 'TrustVault' });
 });
@@ -238,18 +346,27 @@ app.post('/api/auth/register', loginLimiter, (req, res) => {
       role
     });
 
-    req.session.userId = created.id;
-    recordAuditEvent({
-      actorId: created.id,
-      actorName: created.name,
-      action: 'user_registered',
-      resourceType: 'user',
-      resourceId: created.id,
-      details: { email: created.email, role: created.role },
-      ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
-    });
+    startUserSession(req, created.id, (sessionError) => {
+      if (sessionError) {
+        return res.status(500).json({ error: 'Unable to establish a session.' });
+      }
 
-    return res.status(201).json({ user: serializeUser(created) });
+      try {
+        recordAuditEvent({
+          actorId: created.id,
+          actorName: created.name,
+          action: 'user_registered',
+          resourceType: 'user',
+          resourceId: created.id,
+          details: { email: created.email, role: created.role },
+          ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
+        });
+
+        return res.status(201).json({ user: serializeUser(created) });
+      } catch (error) {
+        return res.status(500).json({ error: 'Unable to register user.' });
+      }
+    });
   } catch (error) {
     return res.status(500).json({ error: 'Unable to register user.' });
   }
@@ -276,18 +393,27 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
-    req.session.userId = user.id;
-    recordAuditEvent({
-      actorId: user.id,
-      actorName: user.name,
-      action: 'user_login',
-      resourceType: 'user',
-      resourceId: user.id,
-      details: { email: user.email },
-      ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
-    });
+    startUserSession(req, user.id, (sessionError) => {
+      if (sessionError) {
+        return res.status(500).json({ error: 'Unable to establish a session.' });
+      }
 
-    return res.json({ user: serializeUser(user) });
+      try {
+        recordAuditEvent({
+          actorId: user.id,
+          actorName: user.name,
+          action: 'user_login',
+          resourceType: 'user',
+          resourceId: user.id,
+          details: { email: user.email },
+          ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
+        });
+
+        return res.json({ user: serializeUser(user) });
+      } catch (error) {
+        return res.status(500).json({ error: 'Unable to log in.' });
+      }
+    });
   } catch (error) {
     return res.status(500).json({ error: 'Unable to log in.' });
   }
@@ -497,8 +623,25 @@ app.post('/api/documents', requireAuth, upload.single('file'), async (req, res) 
     }
   }
 
-  const detectedMime = fileType ? fileType.mime : null;
-  if (detectedMime && !['application/pdf', 'image/png', 'image/jpeg', 'text/plain', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'].includes(detectedMime)) {
+  const docxMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  let detectedMime = fileType ? fileType.mime : null;
+
+  if (extension === '.txt') {
+    detectedMime = 'text/plain';
+  } else if (extension === '.docx' && detectedMime === 'application/zip'
+    && zipContainsEntries(fileBuffer, ['[Content_Types].xml', 'word/document.xml'])) {
+    detectedMime = docxMime;
+  }
+
+  const expectedMimeByExtension = {
+    '.pdf': 'application/pdf',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.txt': 'text/plain',
+    '.docx': docxMime
+  };
+  if (!ALLOWED_MIME_TYPES.has(detectedMime) || expectedMimeByExtension[extension] !== detectedMime) {
     fs.unlinkSync(req.file.path);
     return res.status(400).json({ error: 'The file content type is not allowed.' });
   }
