@@ -3,7 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 
-const dataDir = path.join(__dirname, 'data');
+const dataDir = process.env.TRUSTVAULT_DATA_DIR || path.join(__dirname, 'data');
 fs.mkdirSync(dataDir, { recursive: true });
 
 const dbPath = path.join(dataDir, 'trustvault.db');
@@ -81,6 +81,14 @@ function initializeDatabase() {
       value TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      sid TEXT PRIMARY KEY NOT NULL,
+      sess TEXT NOT NULL,
+      expires INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions(expires);
   `);
 
   const rows = db.prepare('SELECT COUNT(*) AS count FROM users').get();
@@ -160,7 +168,7 @@ function getUserById(id) {
 }
 
 function getUserByEmail(email) {
-  return db.prepare('SELECT * FROM users WHERE email = ?').get(email.trim().toLowerCase());
+  return db.prepare('SELECT * FROM users WHERE lower(email) = ?').get(email.trim().toLowerCase());
 }
 
 function createUser({ id, name, email, passwordHash, role, status = 'active' }) {
