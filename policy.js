@@ -9,7 +9,11 @@ function sanitizeFilename(name) {
     return 'document';
   }
 
-  const trimmed = name.replace(/[\\/]+/g, '').trim();
+  const trimmed = name
+    .split(/[\\/]+/)
+    .filter((segment) => segment && segment !== '.' && segment !== '..')
+    .join('_')
+    .trim();
   const cleaned = trimmed.replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/_+/g, '_');
   return cleaned || 'document';
 }
