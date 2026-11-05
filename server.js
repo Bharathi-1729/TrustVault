@@ -4,6 +4,7 @@ const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
@@ -14,11 +15,13 @@ const {
   getUserByEmail,
   getUserById,
   getAllUsers,
-  createUser,
+  listAllDocuments,
+  createRegisteredUser,
   updateUser,
   getDocumentById,
   listDocumentsForUser,
   getDocumentPermissions,
+  getDocumentAuditEvents,
   upsertPermission,
   revokePermission,
   insertDocument,
@@ -41,6 +44,10 @@ const {
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
+const sessionSecret = process.env.TRUSTVAULT_SESSION_SECRET;
+if (process.env.NODE_ENV === 'production' && (!sessionSecret || sessionSecret.length < 32)) {
+  throw new Error('TRUSTVAULT_SESSION_SECRET must be set to at least 32 characters in production.');
+}
 const privateUploadDir = process.env.TRUSTVAULT_UPLOAD_DIR || path.join(__dirname, 'private_uploads');
 fs.mkdirSync(privateUploadDir, { recursive: true });
 const staticDir = __dirname;
@@ -117,7 +124,7 @@ class SQLiteSessionStore extends session.Store {
 }
 
 app.use(session({
-  secret: process.env.TRUSTVAULT_SESSION_SECRET || 'trustvault-dev-secret',
+  secret: sessionSecret || crypto.randomBytes(32).toString('hex'),
   store: new SQLiteSessionStore(db),
   resave: false,
   saveUninitialized: false,
@@ -137,7 +144,21 @@ const loginLimiter = rateLimit({
   message: { error: 'Too many login attempts. Please wait and try again.' }
 });
 
-app.use(express.static(staticDir, { index: false }));
+app.get('/styles.css', (_req, res) => {
+  res.sendFile(path.join(staticDir, 'styles.css'));
+});
+
+app.get('/app.js', (_req, res) => {
+  res.sendFile(path.join(staticDir, 'app.js'));
+});
+
+app.get('/index.html', (_req, res) => {
+  res.sendFile(path.join(staticDir, 'index.html'));
+});
+
+app.get('/motion.html', (_req, res) => {
+  res.sendFile(path.join(staticDir, 'motion.html'));
+});
 
 function serializeUser(user) {
   if (!user) return null;
@@ -149,6 +170,18 @@ function getSessionUser(req) {
   const userId = req.session && req.session.userId;
   if (!userId) return null;
   return getUserById(userId);
+}
+
+function recordAuthorizationDenial(req, user, action, resourceId = null) {
+  recordAuditEvent({
+    actorId: user ? user.id : null,
+    actorName: user ? user.name : null,
+    action: 'authorization_denied',
+    resourceType: resourceId ? 'document' : 'route',
+    resourceId,
+    details: { attemptedAction: action },
+    ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
+  });
 }
 
 function startUserSession(req, userId, callback) {
@@ -165,6 +198,7 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Authentication required.' });
   }
   if (user.status !== 'active') {
+    recordAuthorizationDenial(req, user, 'protected_api_access');
     return res.status(403).json({ error: 'User account is disabled.' });
   }
   req.user = user;
@@ -174,9 +208,31 @@ function requireAuth(req, res, next) {
 function requireAdministrator(req, res, next) {
   const user = getSessionUser(req);
   if (!user) return res.status(401).json({ error: 'Authentication required.' });
-  if (user.role !== 'administrator') return res.status(403).json({ error: 'Administrative access required.' });
+  if (user.status !== 'active') {
+    recordAuthorizationDenial(req, user, 'administrative_access');
+    return res.status(403).json({ error: 'User account is disabled.' });
+  }
+  if (user.role !== 'administrator') {
+    recordAuthorizationDenial(req, user, 'administrative_access');
+    return res.status(403).json({ error: 'Administrative access required.' });
+  }
   req.user = user;
   next();
+}
+
+function canManageDocumentPermissions(user, document) {
+  return Boolean(user && document && (
+    user.role === 'administrator'
+    || (user.role === 'document_owner' && document.owner_id === user.id)
+  ));
+}
+
+function requireDocumentUploader(req, res, next) {
+  if (req.user.role !== 'document_owner' && req.user.role !== 'administrator') {
+    recordAuthorizationDenial(req, req.user, 'document_upload');
+    return res.status(403).json({ error: 'Only document owners can upload files.' });
+  }
+  return next();
 }
 
 function getEffectiveDocumentPermission(user, documentId) {
@@ -206,8 +262,8 @@ function getEffectiveDocumentPermission(user, documentId) {
 function canAccessDocument(user, document, requiredLevel = 'read') {
   if (!user || !document) return false;
   if (user.status !== 'active') return false;
+  if (requiredLevel === 'edit' && user.role === 'viewer') return false;
   if (document.owner_id === user.id) return true;
-  if (user.role === 'administrator') return false;
 
   const activeLevel = getEffectiveDocumentPermission(user, document);
   if (!activeLevel) return false;
@@ -229,19 +285,32 @@ function addAudit(action, req, details, resourceType = null, resourceId = null) 
   });
 }
 
+function getStoredDocumentPath(document) {
+  const root = path.resolve(privateUploadDir);
+  if (typeof document.storage_key !== 'string' || path.basename(document.storage_key) !== document.storage_key) {
+    return null;
+  }
+  const extension = path.extname(document.original_name || '').toLowerCase();
+  const filePath = path.resolve(root, `${document.storage_key}${extension}`);
+  return filePath.startsWith(`${root}${path.sep}`) ? filePath : null;
+}
+
 function buildDocumentSummary(document, user) {
-  const summary = {
-    ...document,
-    ownerName: user && user.id === document.owner_id ? user.name : null,
+  const owner = user && user.id === document.owner_id ? user : getUserById(document.owner_id);
+  return {
+    id: document.id,
+    owner_id: document.owner_id,
+    name: document.name,
+    category: document.category,
+    description: document.description,
+    mime_type: document.mime_type,
+    size_bytes: document.size_bytes,
+    scan_status: document.scan_status,
+    created_at: document.created_at,
+    updated_at: document.updated_at,
+    ownerName: owner ? owner.name : 'Unknown',
     accessLevel: getEffectiveDocumentPermission(user, document)
   };
-
-  if (summary.ownerName === null) {
-    const owner = getUserById(document.owner_id);
-    summary.ownerName = owner ? owner.name : 'Unknown';
-  }
-
-  return summary;
 }
 
 function getUserDocumentAccessLevel(user, document) {
@@ -316,38 +385,41 @@ app.get('/api/health', (_req, res) => {
 app.post('/api/auth/register', loginLimiter, (req, res) => {
   try {
     const { name, email, password } = req.body || {};
-    if (!name || !email || !password) {
+    if (typeof name !== 'string' || typeof email !== 'string' || typeof password !== 'string'
+      || !name.trim() || !email.trim() || !password) {
       return res.status(400).json({ error: 'Name, email, and password are required.' });
     }
     if (String(name).trim().length < 2) {
       return res.status(400).json({ error: 'Name must be at least 2 characters.' });
     }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) {
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
       return res.status(400).json({ error: 'Provide a valid email address.' });
     }
     if (String(password).length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters.' });
     }
+    if (Buffer.byteLength(password, 'utf8') > 72) {
+      return res.status(400).json({ error: 'Password must not exceed 72 UTF-8 bytes.' });
+    }
 
-    const existingUser = getUserByEmail(String(email));
+    const existingUser = getUserByEmail(normalizedEmail);
     if (existingUser) {
       return res.status(409).json({ error: 'An account with that email already exists.' });
     }
 
-    const allUsers = getAllUsers();
-    const role = allUsers.length === 0 ? 'administrator' : 'viewer';
     const id = uuidv4();
     const passwordHash = bcrypt.hashSync(String(password), 12);
-    const created = createUser({
+    const created = createRegisteredUser({
       id,
       name: String(name).trim(),
-      email: String(email).trim().toLowerCase(),
-      passwordHash,
-      role
+      email: normalizedEmail,
+      passwordHash
     });
 
     startUserSession(req, created.id, (sessionError) => {
       if (sessionError) {
+        console.error('Unable to establish registration session:', sessionError);
         return res.status(500).json({ error: 'Unable to establish a session.' });
       }
 
@@ -364,10 +436,15 @@ app.post('/api/auth/register', loginLimiter, (req, res) => {
 
         return res.status(201).json({ user: serializeUser(created) });
       } catch (error) {
+        console.error('Unable to register user:', error);
         return res.status(500).json({ error: 'Unable to register user.' });
       }
     });
   } catch (error) {
+    if (error && error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+      return res.status(409).json({ error: 'An account with that email already exists.' });
+    }
+    console.error('Unable to register user:', error);
     return res.status(500).json({ error: 'Unable to register user.' });
   }
 });
@@ -375,8 +452,11 @@ app.post('/api/auth/register', loginLimiter, (req, res) => {
 app.post('/api/auth/login', loginLimiter, (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) {
+    if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
       return res.status(400).json({ error: 'Email and password are required.' });
+    }
+    if (Buffer.byteLength(password, 'utf8') > 72) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
     const user = getUserByEmail(String(email).trim().toLowerCase());
@@ -395,6 +475,7 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
 
     startUserSession(req, user.id, (sessionError) => {
       if (sessionError) {
+        console.error('Unable to establish login session:', sessionError);
         return res.status(500).json({ error: 'Unable to establish a session.' });
       }
 
@@ -411,6 +492,7 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
 
         return res.json({ user: serializeUser(user) });
       } catch (error) {
+        console.error('Unable to log in:', error);
         return res.status(500).json({ error: 'Unable to log in.' });
       }
     });
@@ -421,20 +503,30 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
 
 app.post('/api/auth/logout', (req, res) => {
   const user = getSessionUser(req);
-  if (user) {
-    recordAuditEvent({
-      actorId: user.id,
-      actorName: user.name,
-      action: 'user_logout',
-      resourceType: 'user',
-      resourceId: user.id,
-      details: { email: user.email },
-      ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
-    });
-  }
+  req.session.destroy((error) => {
+    if (error) {
+      console.error('Unable to destroy login session:', error);
+      return res.status(500).json({ error: 'Unable to log out.' });
+    }
 
-  req.session.destroy(() => {
-    res.json({ ok: true });
+    if (user) {
+      try {
+        recordAuditEvent({
+          actorId: user.id,
+          actorName: user.name,
+          action: 'user_logout',
+          resourceType: 'user',
+          resourceId: user.id,
+          details: { email: user.email },
+          ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
+        });
+      } catch (auditError) {
+        console.error('Unable to record logout audit event:', auditError);
+        return res.status(500).json({ error: 'You have been logged out, but the logout could not be audited.' });
+      }
+    }
+
+    return res.json({ ok: true });
   });
 });
 
@@ -443,20 +535,34 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 });
 
 app.put('/api/profile', requireAuth, (req, res) => {
-  const { name, password } = req.body || {};
+  const body = req.body || {};
+  const { name, password } = body;
   const user = req.user;
-  const nextName = name ? String(name).trim() : user.name;
+  const hasName = Object.hasOwn(body, 'name');
+  const hasPassword = Object.hasOwn(body, 'password');
+
+  if (hasName && typeof name !== 'string') {
+    return res.status(400).json({ error: 'Name must be a string.' });
+  }
+  if (hasPassword && password !== '' && typeof password !== 'string') {
+    return res.status(400).json({ error: 'Password must be a string.' });
+  }
+
+  const nextName = hasName ? name.trim() : user.name;
 
   if (nextName.length < 2) {
     return res.status(400).json({ error: 'Name must be at least 2 characters.' });
   }
 
   let nextPasswordHash = user.password_hash;
-  if (password) {
-    if (String(password).length < 8) {
+  if (hasPassword && password !== '') {
+    if (password.length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters.' });
     }
-    nextPasswordHash = bcrypt.hashSync(String(password), 12);
+    if (Buffer.byteLength(password, 'utf8') > 72) {
+      return res.status(400).json({ error: 'Password must not exceed 72 UTF-8 bytes.' });
+    }
+    nextPasswordHash = bcrypt.hashSync(password, 12);
   }
 
   const updated = updateUser(user.id, {
@@ -470,7 +576,7 @@ app.put('/api/profile', requireAuth, (req, res) => {
     action: 'profile_updated',
     resourceType: 'user',
     resourceId: updated.id,
-    details: { changedPassword: !!password },
+    details: { changedPassword: hasPassword && password !== '' },
     ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
   });
 
@@ -478,7 +584,12 @@ app.put('/api/profile', requireAuth, (req, res) => {
 });
 
 app.get('/api/users', requireAuth, (req, res) => {
-  const all = getAllUsers().map((user) => serializeUser(user));
+  if (!['administrator', 'document_owner'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Only owners can access the user directory.' });
+  }
+  const all = getAllUsers()
+    .filter((user) => user.status === 'active' && user.id !== req.user.id)
+    .map((user) => serializeUser(user));
   res.json({ users: all });
 });
 
@@ -529,28 +640,40 @@ app.get('/api/documents/:id', requireAuth, (req, res) => {
   }
 
   if (!canAccessDocument(req.user, document, 'read')) {
-    recordAuditEvent({
-      actorId: req.user.id,
-      actorName: req.user.name,
-      action: 'document_access_denied',
-      resourceType: 'document',
-      resourceId: document.id,
-      details: { reason: 'No active read permission.', documentName: document.name },
-      ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
-    });
+    recordAuthorizationDenial(req, req.user, 'document_read', document.id);
     return res.status(403).json({ error: 'Document access denied.' });
   }
 
   const userAccess = getUserDocumentAccessLevel(req.user, document);
-  const permissions = getDocumentPermissions(document.id);
+  const permissions = canManageDocumentPermissions(req.user, document)
+    ? getDocumentPermissions(document.id)
+    : [];
+  const summary = buildDocumentSummary(document, req.user);
   res.json({
     document: {
-      ...document,
-      ownerName: getUserById(document.owner_id)?.name || 'Unknown',
+      ...summary,
       permissions,
       accessLevel: userAccess || 'owner'
     }
   });
+});
+
+app.get('/api/documents/:id/activity', requireAuth, (req, res) => {
+  const document = getDocumentById(req.params.id);
+  if (!document) return res.status(404).json({ error: 'Document not found.' });
+  if (!canAccessDocument(req.user, document, 'read')) {
+    recordAuthorizationDenial(req, req.user, 'document_activity', document.id);
+    return res.status(403).json({ error: 'Document access denied.' });
+  }
+
+  const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 200);
+  const activity = getDocumentAuditEvents(document.id, limit).map((entry) => ({
+    action: entry.action,
+    actor_name: entry.actor_name,
+    created_at: entry.created_at,
+    details: entry.details
+  }));
+  res.json({ activity });
 });
 
 app.get('/api/documents/:id/download', requireAuth, (req, res) => {
@@ -560,15 +683,7 @@ app.get('/api/documents/:id/download', requireAuth, (req, res) => {
   }
 
   if (!canAccessDocument(req.user, document, 'read')) {
-    recordAuditEvent({
-      actorId: req.user.id,
-      actorName: req.user.name,
-      action: 'document_download_denied',
-      resourceType: 'document',
-      resourceId: document.id,
-      details: { reason: 'No active read permission for download.' },
-      ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
-    });
+    recordAuthorizationDenial(req, req.user, 'document_download', document.id);
     return res.status(403).json({ error: 'Document access denied.' });
   }
 
@@ -585,29 +700,58 @@ app.get('/api/documents/:id/download', requireAuth, (req, res) => {
     return res.status(403).json({ error: 'This document is awaiting security review.' });
   }
 
-  const extension = path.extname(document.original_name || '');
-  const filePath = path.join(privateUploadDir, `${document.storage_key}${extension}`);
-  if (!fs.existsSync(filePath)) {
+  const filePath = getStoredDocumentPath(document);
+  if (!filePath || !fs.existsSync(filePath)) {
     return res.status(404).json({ error: 'Document file is not available.' });
   }
 
-  res.download(filePath, sanitizeFilename(document.name) || 'document');
+  res.download(filePath, sanitizeFilename(document.name) || 'document', (error) => {
+    if (error) {
+      recordAuditEvent({
+        actorId: req.user.id,
+        actorName: req.user.name,
+        action: 'document_download_failed',
+        resourceType: 'document',
+        resourceId: document.id,
+        details: { error: error.code || 'transfer_failed' },
+        ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
+      });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Unable to download the document.' });
+      }
+      return;
+    }
+
+    recordAuditEvent({
+      actorId: req.user.id,
+      actorName: req.user.name,
+      action: 'document_downloaded',
+      resourceType: 'document',
+      resourceId: document.id,
+      details: { documentName: document.name },
+      ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
+    });
+  });
 });
 
-app.post('/api/documents', requireAuth, upload.single('file'), async (req, res) => {
+app.post('/api/documents', requireAuth, requireDocumentUploader, upload.single('file'), async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'Authentication required.' });
-  if (req.user.role !== 'document_owner' && req.user.role !== 'administrator') {
-    return res.status(403).json({ error: 'Only document owners can upload files.' });
-  }
 
   if (!req.file) {
     return res.status(400).json({ error: 'A file is required for upload.' });
   }
 
-  const fileBuffer = fs.readFileSync(req.file.path);
-  const { fileTypeFromBuffer } = await import('file-type');
-  const fileType = await fileTypeFromBuffer(fileBuffer);
+  let fileBuffer;
+  let fileType;
   const extension = path.extname(req.file.originalname || '').toLowerCase();
+  try {
+    fileBuffer = fs.readFileSync(req.file.path);
+    const { fileTypeFromBuffer } = await import('file-type');
+    fileType = await fileTypeFromBuffer(fileBuffer);
+  } catch (error) {
+    if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    throw error;
+  }
 
   if (fileBuffer.length === 0) {
     fs.unlinkSync(req.file.path);
@@ -615,11 +759,16 @@ app.post('/api/documents', requireAuth, upload.single('file'), async (req, res) 
   }
 
   if (extension === '.txt') {
-    const text = fileBuffer.toString('utf8');
-    const looksText = [...text].every((char) => char.charCodeAt(0) === 9 || char.charCodeAt(0) === 10 || char.charCodeAt(0) === 13 || (char.charCodeAt(0) >= 32 && char.charCodeAt(0) <= 126));
-    if (!looksText) {
+    let text;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(fileBuffer);
+    } catch (_error) {
       fs.unlinkSync(req.file.path);
       return res.status(400).json({ error: 'Text files must be valid UTF-8 content.' });
+    }
+    if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(text)) {
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({ error: 'Text files cannot contain binary control characters.' });
     }
   }
 
@@ -679,23 +828,15 @@ app.post('/api/documents', requireAuth, upload.single('file'), async (req, res) 
     ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
   });
 
-  return res.status(201).json({ document: { ...doc, ownerName: req.user.name, accessLevel: 'owner' } });
+  return res.status(201).json({ document: buildDocumentSummary(getDocumentById(doc.id), req.user) });
 });
 
 app.put('/api/documents/:id', requireAuth, (req, res) => {
   const document = getDocumentById(req.params.id);
   if (!document) return res.status(404).json({ error: 'Document not found.' });
 
-  if (document.owner_id !== req.user.id && !canAccessDocument(req.user, document, 'edit')) {
-    recordAuditEvent({
-      actorId: req.user.id,
-      actorName: req.user.name,
-      action: 'document_update_denied',
-      resourceType: 'document',
-      resourceId: document.id,
-      details: { reason: 'Insufficient permission for metadata edit.' },
-      ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
-    });
+  if (!canAccessDocument(req.user, document, 'edit')) {
+    recordAuthorizationDenial(req, req.user, 'document_edit', document.id);
     return res.status(403).json({ error: 'You are not allowed to edit this document.' });
   }
 
@@ -719,18 +860,21 @@ app.put('/api/documents/:id', requireAuth, (req, res) => {
     ip: req.ip || req.headers['x-forwarded-for'] || 'unknown'
   });
 
-  return res.json({ document: { ...updated, ownerName: getUserById(document.owner_id)?.name || 'Unknown' } });
+  return res.json({ document: buildDocumentSummary(updated, req.user) });
 });
 
 app.delete('/api/documents/:id', requireAuth, (req, res) => {
   const document = getDocumentById(req.params.id);
   if (!document) return res.status(404).json({ error: 'Document not found.' });
-  if (document.owner_id !== req.user.id) {
+  if (document.owner_id !== req.user.id || req.user.role === 'viewer') {
+    recordAuthorizationDenial(req, req.user, 'document_delete', document.id);
     return res.status(403).json({ error: 'Only the document owner can delete it.' });
   }
 
-  const extension = path.extname(document.original_name || '');
-  const diskPath = path.join(privateUploadDir, `${document.storage_key}${extension}`);
+  const diskPath = getStoredDocumentPath(document);
+  if (!diskPath) {
+    return res.status(404).json({ error: 'Document file is not available.' });
+  }
   if (fs.existsSync(diskPath)) fs.unlinkSync(diskPath);
 
   deleteDocument(document.id);
@@ -750,10 +894,17 @@ app.delete('/api/documents/:id', requireAuth, (req, res) => {
 app.post('/api/documents/:id/share', requireAuth, (req, res) => {
   const document = getDocumentById(req.params.id);
   if (!document) return res.status(404).json({ error: 'Document not found.' });
-  if (document.owner_id !== req.user.id) return res.status(403).json({ error: 'Only the owner can change permissions.' });
+  if (!canManageDocumentPermissions(req.user, document)) {
+    recordAuthorizationDenial(req, req.user, 'document_share', document.id);
+    return res.status(403).json({ error: 'Only the document owner or an administrator can change permissions.' });
+  }
 
   const email = String(req.body.email || '').trim().toLowerCase();
-  const permission = normalizePermission(req.body.permission || 'read');
+  const requestedPermission = String(req.body.permission || 'read').toLowerCase();
+  if (!['read', 'edit'].includes(requestedPermission)) {
+    return res.status(400).json({ error: 'Permission must be read or edit.' });
+  }
+  const permission = normalizePermission(requestedPermission);
   const target = getUserByEmail(email);
 
   if (!target || target.status !== 'active') {
@@ -762,6 +913,9 @@ app.post('/api/documents/:id/share', requireAuth, (req, res) => {
 
   if (target.id === req.user.id) {
     return res.status(400).json({ error: 'The document owner is already authorized.' });
+  }
+  if (permission === 'edit' && target.role === 'viewer') {
+    return res.status(400).json({ error: 'Viewers have read-only access. Assign the document owner role to grant edit access.' });
   }
 
   let expiresAt = req.body.expiresAt || null;
@@ -794,10 +948,32 @@ app.post('/api/documents/:id/share', requireAuth, (req, res) => {
   res.status(201).json({ permission: granted, user: serializeUser(target) });
 });
 
+app.get('/api/documents/:id/shares', requireAuth, (req, res) => {
+  const document = getDocumentById(req.params.id);
+  if (!document) return res.status(404).json({ error: 'Document not found.' });
+  if (!canManageDocumentPermissions(req.user, document)) {
+    recordAuthorizationDenial(req, req.user, 'document_share_list', document.id);
+    return res.status(403).json({ error: 'Only the document owner or an administrator can view sharing permissions.' });
+  }
+
+  const shares = getDocumentPermissions(document.id).map((permission) => ({
+    id: permission.id,
+    user_id: permission.user_id,
+    user_name: permission.user_name,
+    user_email: permission.user_email,
+    permission: permission.permission,
+    expires_at: permission.expires_at
+  }));
+  res.json({ shares });
+});
+
 app.delete('/api/documents/:id/share/:userId', requireAuth, (req, res) => {
   const document = getDocumentById(req.params.id);
   if (!document) return res.status(404).json({ error: 'Document not found.' });
-  if (document.owner_id !== req.user.id) return res.status(403).json({ error: 'Only the owner can revoke permissions.' });
+  if (!canManageDocumentPermissions(req.user, document)) {
+    recordAuthorizationDenial(req, req.user, 'document_permission_revoke', document.id);
+    return res.status(403).json({ error: 'Only the document owner or an administrator can revoke permissions.' });
+  }
 
   const revoked = revokePermission(document.id, req.params.userId);
   if (!revoked) {
@@ -817,9 +993,9 @@ app.delete('/api/documents/:id/share/:userId', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/admin/dashboard', requireAdministrator, (req, res) => {
+app.get('/api/admin/dashboard', requireAdministrator, (_req, res) => {
   const users = getAllUsers();
-  const docs = listDocumentsForUser(req.user);
+  const docs = listAllDocuments();
   const audit = getAuditEvents(10);
 
   res.json({
@@ -861,6 +1037,17 @@ app.get('/api/admin/users', requireAdministrator, (req, res) => {
   res.json({ users: getAllUsers().map((user) => serializeUser(user)) });
 });
 
+app.get('/api/admin/documents', requireAdministrator, (_req, res) => {
+  const documents = listAllDocuments().map((document) => ({
+    id: document.id,
+    name: document.name,
+    category: document.category,
+    ownerName: getUserById(document.owner_id)?.name || 'Unknown',
+    created_at: document.created_at
+  }));
+  res.json({ documents });
+});
+
 app.put('/api/admin/users/:id/role', requireAdministrator, (req, res) => {
   const target = getUserById(req.params.id);
   if (!target) return res.status(404).json({ error: 'User not found.' });
@@ -870,6 +1057,14 @@ app.put('/api/admin/users/:id/role', requireAdministrator, (req, res) => {
 
   if (target.id === req.user.id && nextRole !== 'administrator') {
     return res.status(400).json({ error: 'Administrators cannot demote themselves.' });
+  }
+  if (target.status === 'active' && target.role === 'administrator' && nextRole !== 'administrator') {
+    const activeAdministrators = getAllUsers().filter(
+      (user) => user.status === 'active' && user.role === 'administrator'
+    ).length;
+    if (activeAdministrators <= 1) {
+      return res.status(409).json({ error: 'The last active administrator cannot be demoted.' });
+    }
   }
 
   const updated = updateUser(target.id, { role: nextRole });
@@ -893,6 +1088,14 @@ app.put('/api/admin/users/:id/status', requireAdministrator, (req, res) => {
   if (!['active', 'disabled'].includes(nextStatus)) return res.status(400).json({ error: 'Unsupported status value.' });
   if (target.id === req.user.id && nextStatus === 'disabled') {
     return res.status(400).json({ error: 'An administrator cannot disable their own account.' });
+  }
+  if (nextStatus === 'disabled' && target.status === 'active' && target.role === 'administrator') {
+    const activeAdministrators = getAllUsers().filter(
+      (user) => user.status === 'active' && user.role === 'administrator'
+    ).length;
+    if (activeAdministrators <= 1) {
+      return res.status(409).json({ error: 'The last active administrator cannot be disabled.' });
+    }
   }
 
   const updated = updateUser(target.id, { status: nextStatus });
