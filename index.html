@@ -45,7 +45,20 @@
         </label>
         <label>
           Password
-          <input type="password" name="password" placeholder="At least 8 characters" required />
+          <input
+            type="password"
+            name="password"
+            placeholder="Uppercase, lowercase, number, and symbol"
+            minlength="8"
+            pattern="(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[^A-Za-z0-9]).{8,}"
+            title="Use at least 8 characters with uppercase and lowercase letters, a number, and a symbol."
+            autocomplete="new-password"
+            required
+          />
+        </label>
+        <label>
+          Confirm password
+          <input type="password" name="confirmPassword" minlength="8" autocomplete="new-password" required />
         </label>
         <button type="submit" class="primary-btn">Create account</button>
       </form>
