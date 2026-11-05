@@ -556,6 +556,17 @@ function getDocumentAuditEvents(documentId, limit = 100) {
   `).all(documentId, detailsPattern, limit);
 }
 
+function getUserAuditEvents(userId, limit = 100) {
+  return db.prepare(`
+    SELECT id, actor_id, actor_name, action, resource_type, resource_id,
+      details, event_result, created_at
+    FROM audit_events
+    WHERE actor_id = ?
+    ORDER BY rowid DESC
+    LIMIT ?
+  `).all(userId, limit);
+}
+
 module.exports = {
   db,
   initializeDatabase,
@@ -582,5 +593,6 @@ module.exports = {
   updateDocument,
   deleteDocument,
   getAuditEvents,
-  getDocumentAuditEvents
+  getDocumentAuditEvents,
+  getUserAuditEvents
 };
