@@ -15,6 +15,34 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function migrateUserColumns() {
+  const columns = new Set(db.prepare('PRAGMA table_info(users)').all().map((column) => column.name));
+  const requiredColumns = ['id', 'name', 'email', 'password_hash', 'created_at', 'updated_at'];
+  const missingRequiredColumns = requiredColumns.filter((column) => !columns.has(column));
+  if (missingRequiredColumns.length) {
+    throw new Error(`Unsupported users table; missing required columns: ${missingRequiredColumns.join(', ')}`);
+  }
+
+  const addRole = !columns.has('role');
+  db.transaction(() => {
+    if (addRole) {
+      db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'viewer'");
+    }
+    if (!columns.has('status')) {
+      db.exec("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+    }
+
+    if (addRole) {
+      const firstRegisteredUser = db.prepare(
+        'SELECT id FROM users ORDER BY created_at ASC, id ASC LIMIT 1'
+      ).get();
+      if (firstRegisteredUser) {
+        db.prepare("UPDATE users SET role = 'administrator' WHERE id = ?").run(firstRegisteredUser.id);
+      }
+    }
+  })();
+}
+
 function initializeDatabase() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -91,6 +119,8 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions(expires);
   `);
 
+  migrateUserColumns();
+
   const rows = db.prepare('SELECT COUNT(*) AS count FROM users').get();
   if (!rows || Number(rows.count) === 0) {
     db.prepare('INSERT OR IGNORE INTO settings(name, value, updated_at) VALUES(?, ?, ?)')
@@ -110,33 +140,45 @@ function setSetting(name, value) {
 }
 
 function recordAuditEvent({ actorId, actorName, action, resourceType, resourceId, details, ip }) {
-  const latestHash = db.prepare('SELECT hash FROM audit_events ORDER BY created_at DESC, id DESC LIMIT 1').get();
+  const latestHash = db.prepare('SELECT hash FROM audit_events ORDER BY rowid DESC LIMIT 1').get();
   const prevHash = latestHash ? latestHash.hash : 'GENESIS';
   const createdAt = nowIso();
-  const payload = JSON.stringify({
-    actorId,
-    actorName,
+  const event = {
+    actorId: actorId || null,
+    actorName: actorName || null,
     action,
-    resourceType,
-    resourceId,
-    details,
-    ip,
+    resourceType: resourceType || null,
+    resourceId: resourceId || null,
+    details: details || null,
+    ip: ip || null,
     createdAt,
     prevHash
-  });
-  const digest = crypto.createHash('sha256').update(payload).digest('hex');
+  };
+  const digest = crypto.createHash('sha256').update(JSON.stringify(event)).digest('hex');
   const id = crypto.randomUUID();
 
   db.prepare(`
     INSERT INTO audit_events(id, actor_id, actor_name, action, resource_type, resource_id, details, ip, created_at, prev_hash, hash)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, actorId || null, actorName || null, action, resourceType || null, resourceId || null, details ? JSON.stringify(details) : null, ip || null, createdAt, prevHash, digest);
+  `).run(
+    id,
+    event.actorId,
+    event.actorName,
+    event.action,
+    event.resourceType,
+    event.resourceId,
+    event.details ? JSON.stringify(event.details) : null,
+    event.ip,
+    createdAt,
+    prevHash,
+    digest
+  );
 
   return digest;
 }
 
 function verifyAuditChain() {
-  const rows = db.prepare('SELECT * FROM audit_events ORDER BY created_at ASC, id ASC').all();
+  const rows = db.prepare('SELECT * FROM audit_events ORDER BY rowid ASC').all();
   let previous = 'GENESIS';
   let issues = [];
 
@@ -176,9 +218,22 @@ function createUser({ id, name, email, passwordHash, role, status = 'active' }) 
   db.prepare(`
     INSERT INTO users(id, name, email, password_hash, role, status, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, name, email.toLowerCase(), passwordHash, role, status, now, now);
+  `).run(id, name, email.trim().toLowerCase(), passwordHash, role, status, now, now);
 
   return getUserById(id);
+}
+
+function createRegisteredUser({ id, name, email, passwordHash }) {
+  return db.transaction(() => {
+    const userCount = db.prepare('SELECT COUNT(*) AS count FROM users').get().count;
+    return createUser({
+      id,
+      name,
+      email,
+      passwordHash,
+      role: Number(userCount) === 0 ? 'administrator' : 'viewer'
+    });
+  }).immediate();
 }
 
 function updateUser(id, fields) {
@@ -197,6 +252,15 @@ function updateUser(id, fields) {
 
 function getAllUsers() {
   return db.prepare('SELECT * FROM users ORDER BY created_at DESC').all();
+}
+
+function listAllDocuments() {
+  return db.prepare(`
+    SELECT id, owner_id, name, category, created_at
+    FROM documents
+    WHERE is_deleted = 0
+    ORDER BY created_at DESC
+  `).all();
 }
 
 function getDocumentById(id) {
@@ -320,8 +384,19 @@ function deleteDocument(id) {
 
 function getAuditEvents(limit = 100) {
   return db.prepare(`
-    SELECT * FROM audit_events ORDER BY created_at DESC LIMIT ?
+    SELECT * FROM audit_events ORDER BY rowid DESC LIMIT ?
   `).all(limit);
+}
+
+function getDocumentAuditEvents(documentId, limit = 100) {
+  const detailsPattern = `%"documentId":${JSON.stringify(String(documentId))}%`;
+  return db.prepare(`
+    SELECT * FROM audit_events
+    WHERE (resource_type = 'document' AND resource_id = ?)
+      OR (resource_type = 'document_permission' AND details LIKE ?)
+    ORDER BY rowid DESC
+    LIMIT ?
+  `).all(documentId, detailsPattern, limit);
 }
 
 module.exports = {
@@ -335,8 +410,10 @@ module.exports = {
   getUserById,
   getUserByEmail,
   createUser,
+  createRegisteredUser,
   updateUser,
   getAllUsers,
+  listAllDocuments,
   getDocumentById,
   listDocumentsForUser,
   getDocumentPermissions,
@@ -345,5 +422,6 @@ module.exports = {
   insertDocument,
   updateDocument,
   deleteDocument,
-  getAuditEvents
+  getAuditEvents,
+  getDocumentAuditEvents
 };
