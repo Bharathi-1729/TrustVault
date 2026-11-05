@@ -1,33 +1,23 @@
 {
-  "name": "@tokenizer/token",
-  "version": "0.3.0",
-  "description": "TypeScript definition for strtok3 token",
-  "main": "",
-  "types": "index.d.ts",
-  "files": [
-    "index.d.ts"
-  ],
+  "name": "trustvault",
+  "version": "1.0.0",
+  "description": "TrustVault Enterprise Secure Document Sharing Platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "dotnet test tests/TrustVault.IntegrationTests/TrustVault.IntegrationTests.csproj"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "multer": "^1.4.5-lts.1"
+  },
   "keywords": [
-    "token",
-    "interface",
-    "tokenizer",
-    "TypeScript"
+    "security",
+    "document-sharing",
+    "audit-trail",
+    "access-control"
   ],
-  "author": {
-    "name": "Borewit",
-    "url": "https://github.com/Borewit"
-  },
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/Borewit/tokenizer-token.git"
-  },
-  "bugs": {
-    "url": "https://github.com/Borewit/tokenizer-token/issues"
-  },
-  "typeScriptVersion": "3.0",
-  "dependencies": {},
-  "devDependencies": {
-    "@types/node": "^13.1.0"
-  }
+  "author": "TrustVault Team",
+  "license": "ISC"
 }
