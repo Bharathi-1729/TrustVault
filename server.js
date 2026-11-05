@@ -10,12 +10,12 @@ const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 
 const sessionSecret = process.env.TRUSTVAULT_SESSION_SECRET;
-const auditSecret = process.env.TRUSTVAULT_AUDIT_SECRET;
+const auditSecret = process.env.TRUSTVAULT_AUDIT_SECRET || sessionSecret;
 if (process.env.NODE_ENV === 'production' && (!sessionSecret || sessionSecret.length < 32)) {
   throw new Error('TRUSTVAULT_SESSION_SECRET must be set to at least 32 characters in production.');
 }
 if (process.env.NODE_ENV === 'production' && (!auditSecret || auditSecret.length < 32)) {
-  throw new Error('TRUSTVAULT_AUDIT_SECRET must be set to at least 32 characters in production.');
+  throw new Error('Set TRUSTVAULT_AUDIT_SECRET or a TRUSTVAULT_SESSION_SECRET of at least 32 characters in production.');
 }
 
 const {
