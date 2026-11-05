@@ -1,6 +1,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { sanitizeFilename, isAllowedRole, normalizePermission } = require('./policy');
+const {
+  sanitizeFilename,
+  isAllowedRole,
+  normalizePermission,
+  isStrongPassword
+} = require('./policy');
 
 test('sanitizeFilename strips unsafe paths and whitespace', () => {
   const value = sanitizeFilename('../../etc/passwd 2024-09-01.pdf');
@@ -18,4 +23,11 @@ test('permission normalization keeps only supported document permissions', () =>
   assert.equal(normalizePermission('read'), 'read');
   assert.equal(normalizePermission('edit'), 'edit');
   assert.equal(normalizePermission('admin'), 'read');
+});
+
+test('new passwords must include upper/lowercase, digits, symbols, and fit bcrypt limits', () => {
+  assert.equal(isStrongPassword('Valid-test-Password1!'), true);
+  assert.equal(isStrongPassword('all-lowercase1!'), false);
+  assert.equal(isStrongPassword('NoDigitsOrSymbol'), false);
+  assert.equal(isStrongPassword(`Valid-${'a'.repeat(70)}1!`), false);
 });
