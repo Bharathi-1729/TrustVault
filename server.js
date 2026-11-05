@@ -33,6 +33,7 @@ const {
   listDocumentsForUser,
   getDocumentPermissions,
   getDocumentAuditEvents,
+  getUserAuditEvents,
   upsertPermission,
   revokePermission,
   insertDocument,
@@ -639,6 +640,15 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ user: serializeUser(req.user) });
 });
 
+app.get('/api/account/activity', requireAuth, (req, res) => {
+  const requestedLimit = Number(req.query.limit || 50);
+  if (!Number.isInteger(requestedLimit)) {
+    return res.status(400).json({ error: 'Activity limit must be a whole number.' });
+  }
+  const limit = Math.min(Math.max(requestedLimit, 1), 200);
+  res.json({ activity: getUserAuditEvents(req.user.id, limit) });
+});
+
 app.put('/api/profile', requireAuth, (req, res) => {
   const body = req.body || {};
   const { name, password } = body;
@@ -926,6 +936,53 @@ app.get('/api/documents/:id/download', requireAuth, (req, res) => {
       details: { documentName: document.name }
     });
   });
+});
+
+app.get('/api/documents/:id/preview', requireAuth, (req, res) => {
+  const document = getDocumentById(req.params.id);
+  if (!document) return res.status(404).json({ error: 'Document not found.' });
+  if (!canAccessDocument(req.user, document, 'read')) {
+    recordAuthorizationDenial(req, req.user, 'document_preview', document.id);
+    return res.status(403).json({ error: 'Document access denied.' });
+  }
+  if (document.scan_status !== 'approved') {
+    recordRequestAuditEvent(req, {
+      actorId: req.user.id,
+      actorName: req.user.name,
+      action: 'document_preview_blocked',
+      resourceType: 'document',
+      resourceId: document.id,
+      details: { scanStatus: document.scan_status },
+      eventResult: 'denied'
+    });
+    return res.status(403).json({ error: 'This document is awaiting security review.' });
+  }
+
+  const previewableTypes = new Set(['application/pdf', 'image/png', 'image/jpeg', 'text/plain']);
+  if (!previewableTypes.has(document.mime_type)) {
+    return res.status(415).json({ error: 'Preview is not available for this file type.' });
+  }
+  const filePath = getStoredDocumentPath(document);
+  if (!filePath || !fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'Document file is not available.' });
+  }
+
+  recordRequestAuditEvent(req, {
+    actorId: req.user.id,
+    actorName: req.user.name,
+    action: 'document_previewed',
+    resourceType: 'document',
+    resourceId: document.id,
+    details: null
+  });
+  res.set({
+    'Content-Type': document.mime_type,
+    'Content-Disposition': `inline; filename="${sanitizeFilename(document.name)}"`,
+    'Content-Security-Policy': "sandbox; default-src 'none'",
+    'X-Content-Type-Options': 'nosniff',
+    'Cache-Control': 'private, no-store'
+  });
+  return res.sendFile(filePath);
 });
 
 app.post('/api/documents', requireAuth, requireDocumentUploader, upload.single('file'), asyncHandler(async (req, res) => {
