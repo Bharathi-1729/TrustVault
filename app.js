@@ -23,7 +23,9 @@ const API = {
     }
 
     if (!response.ok) {
-      throw new Error(payload && payload.error ? payload.error : 'Request failed');
+      const error = new Error(payload && (payload.error || payload.message) ? payload.error || payload.message : 'Request failed');
+      error.status = response.status;
+      throw error;
     }
 
     return payload;
@@ -74,9 +76,8 @@ function bindAuthTabs() {
     };
 
     try {
-      const result = await API.request('/api/auth/login', 'POST', payload);
+      await API.request('/api/auth/login', 'POST', payload);
       window.location.href = '/app.html';
-      console.log(result);
     } catch (error) {
       showMessage(document.getElementById('authMessage'), error.message, 'error');
     }
@@ -104,19 +105,29 @@ async function loadCurrentUser() {
   try {
     const result = await API.request('/api/auth/me');
     return result.user;
-  } catch (_error) {
-    window.location.href = '/';
+  } catch (error) {
+    if (error.status === 401 || error.status === 403) {
+      window.location.href = '/';
+    } else {
+      showMessage(document.getElementById('uploadMessage'), error.message, 'error');
+    }
     return null;
   }
 }
 
 async function loadUsersForShare() {
+  const sharePanel = document.getElementById('sharePanel');
+  if (!['administrator', 'document_owner'].includes(window.currentUser.role)) {
+    sharePanel?.classList.add('hidden');
+    return;
+  }
+
   try {
     const result = await API.request('/api/users');
     const select = document.getElementById('shareUserSelect');
     if (!select) return;
 
-    select.innerHTML = '';
+    select.replaceChildren();
     result.users
       .filter((user) => user.id !== window.currentUser.id)
       .forEach((user) => {
@@ -125,8 +136,87 @@ async function loadUsersForShare() {
         option.textContent = `${user.name} (${user.email})`;
         select.appendChild(option);
       });
+    select.disabled = select.options.length === 0;
+    if (select.disabled) {
+      const option = document.createElement('option');
+      option.value = '';
+      option.textContent = 'No active users available';
+      select.appendChild(option);
+    }
   } catch (error) {
     console.error('Unable to load users', error);
+    showMessage(document.getElementById('shareMessage'), error.message, 'error');
+  }
+}
+
+async function loadDocumentsForShare() {
+  const select = document.getElementById('shareDocumentSelect');
+  if (!select) return;
+
+  const result = window.currentUser.role === 'administrator'
+    ? await API.request('/api/admin/documents')
+    : await API.request('/api/documents?limit=50');
+  const documents = result.documents.filter(
+    (document) => window.currentUser.role === 'administrator' || document.owner_id === window.currentUser.id
+  );
+
+  select.replaceChildren();
+  documents.forEach((document) => {
+    const option = document.createElement('option');
+    option.value = document.id;
+    option.textContent = `${document.name} (${document.ownerName || 'you'})`;
+    select.appendChild(option);
+  });
+  select.disabled = documents.length === 0;
+  if (!documents.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No documents available to manage';
+    select.appendChild(option);
+  }
+}
+
+async function renderSharePermissions() {
+  const list = document.getElementById('sharedAccessList');
+  const documentId = document.getElementById('shareDocumentSelect')?.value;
+  if (!list) return;
+  list.replaceChildren();
+
+  if (!documentId) {
+    const empty = document.createElement('p');
+    empty.textContent = 'Select a document to view its current access.';
+    list.appendChild(empty);
+    return;
+  }
+
+  try {
+    const result = await API.request(`/api/documents/${documentId}/shares`);
+    if (!result.shares.length) {
+      const empty = document.createElement('p');
+      empty.textContent = 'No active shares for this document.';
+      list.appendChild(empty);
+      return;
+    }
+
+    result.shares.forEach((share) => {
+      const row = document.createElement('div');
+      row.className = 'shared-access-row';
+
+      const details = document.createElement('span');
+      const expiry = share.expires_at ? ` • expires ${isoToFriendly(share.expires_at)}` : '';
+      details.textContent = `${share.user_name} (${share.user_email}) • ${share.permission}${expiry}`;
+
+      const revokeButton = document.createElement('button');
+      revokeButton.type = 'button';
+      revokeButton.className = 'secondary-btn';
+      revokeButton.dataset.userId = share.user_id;
+      revokeButton.textContent = 'Revoke';
+
+      row.append(details, revokeButton);
+      list.appendChild(row);
+    });
+  } catch (error) {
+    showMessage(document.getElementById('shareMessage'), error.message, 'error');
   }
 }
 
@@ -134,41 +224,82 @@ async function renderDocuments() {
   const documentList = document.getElementById('documentList');
   if (!documentList) return;
 
-  const page = Number(window.currentPage || 1);
+  const page = Math.max(1, Math.floor(Number(window.currentPage) || 1));
   const search = document.getElementById('searchInput')?.value || '';
 
   try {
     const result = await API.request(`/api/documents?limit=5&page=${page}&search=${encodeURIComponent(search)}`);
     documentList.innerHTML = '';
 
+    const pageLabel = document.getElementById('pageLabel');
+    const totalPages = Math.max(result.totalPages || 1, 1);
+    if (page > totalPages) {
+      window.currentPage = totalPages;
+      return renderDocuments();
+    }
+
+    if (pageLabel) pageLabel.textContent = `Page ${page} / ${totalPages}`;
+    const previousButton = document.getElementById('prevPageBtn');
+    const nextButton = document.getElementById('nextPageBtn');
+    if (previousButton) previousButton.disabled = page <= 1;
+    if (nextButton) nextButton.disabled = page >= totalPages;
+
     if (!result.documents || !result.documents.length) {
-      documentList.innerHTML = '<div class="document-item"><p>No documents are available for your current access.</p></div>';
+      const emptyState = document.createElement('div');
+      emptyState.className = 'document-item document-empty';
+      emptyState.textContent = 'No documents are available for your current access.';
+      documentList.appendChild(emptyState);
       return;
     }
 
-    result.documents.forEach((document) => {
+    result.documents.forEach((doc) => {
       const card = document.createElement('div');
       card.className = 'document-item';
-      card.innerHTML = `
-        <div class="document-header">
-          <div>
-            <strong>${document.name}</strong>
-            <div class="doc-meta">${document.ownerName} • ${document.category}</div>
-          </div>
-          <span class="user-badge">${document.accessLevel || 'read'}</span>
-        </div>
-        <div class="doc-meta">${document.description || 'No description'} • ${isoToFriendly(document.created_at)} • ${document.size_bytes || 0} bytes</div>
-        <div class="document-actions">
-          <button type="button" data-action="download" data-id="${document.id}">Download</button>
-          <button type="button" data-action="metadata" data-id="${document.id}">Details</button>
-          <button type="button" data-action="delete" data-id="${document.id}">Delete</button>
-        </div>
-      `;
+
+      const header = document.createElement('div');
+      header.className = 'document-header';
+
+      const summary = document.createElement('div');
+      const name = document.createElement('strong');
+      name.textContent = doc.name || 'Untitled document';
+
+      const ownerCategory = document.createElement('div');
+      ownerCategory.className = 'doc-meta';
+      ownerCategory.textContent = `${doc.ownerName || 'Unknown owner'} • ${doc.category || 'Uncategorized'}`;
+      summary.append(name, ownerCategory);
+
+      const accessBadge = document.createElement('span');
+      accessBadge.className = 'user-badge';
+      accessBadge.textContent = doc.accessLevel || 'read';
+      header.append(summary, accessBadge);
+
+      const metadata = document.createElement('div');
+      metadata.className = 'doc-meta';
+      metadata.textContent = `${doc.description || 'No description'} • ${isoToFriendly(doc.created_at)} • ${doc.size_bytes || 0} bytes`;
+
+      const actions = document.createElement('div');
+      actions.className = 'document-actions';
+      const availableActions = [
+        ['download', 'Download'],
+        ['metadata', 'Details'],
+        ['activity', 'Activity']
+      ];
+      if (doc.owner_id === window.currentUser.id && window.currentUser.role !== 'viewer') {
+        availableActions.push(['delete', 'Delete']);
+      }
+      for (const [action, label] of availableActions) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.action = action;
+        button.dataset.id = doc.id;
+        button.textContent = label;
+        actions.appendChild(button);
+      }
+
+      card.append(header, metadata, actions);
       documentList.appendChild(card);
     });
 
-    const pageLabel = document.getElementById('pageLabel');
-    if (pageLabel) pageLabel.textContent = `Page ${page} / ${Math.max(result.totalPages || 1, 1)}`;
   } catch (error) {
     showMessage(document.getElementById('uploadMessage'), error.message, 'error');
   }
@@ -197,31 +328,88 @@ async function renderAdminData() {
     document.getElementById('auditCount').textContent = audit.audit.length;
 
     const adminUsersList = document.getElementById('adminUsersList');
-    adminUsersList.innerHTML = '';
     const userList = dashboard.counts.users ? await API.request('/api/admin/users') : { users: [] };
-    userList.users.forEach((user) => {
-      const row = document.createElement('div');
-      row.className = 'admin-row';
-      row.innerHTML = `
-        <div>
-          <strong>${user.name}</strong><br />
-          <small>${user.email} / ${user.role} / ${user.status}</small>
-        </div>
-        <div class="document-actions">
-          <button type="button" data-action="set-role" data-user-id="${user.id}" data-role="document_owner">Owner</button>
-          <button type="button" data-action="set-role" data-user-id="${user.id}" data-role="viewer">Viewer</button>
-          <button type="button" data-action="toggle-status" data-user-id="${user.id}" data-status="${user.status === 'active' ? 'disabled' : 'active'}">${user.status === 'active' ? 'Disable' : 'Enable'}</button>
-        </div>
-      `;
-      adminUsersList.appendChild(row);
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'admin-table-wrap';
+
+    const table = document.createElement('table');
+    table.className = 'admin-users-table';
+    const tableHead = document.createElement('thead');
+    const headerRow = document.createElement('tr');
+    ['Name', 'Email', 'Role', 'Status', 'Actions'].forEach((label) => {
+      const cell = document.createElement('th');
+      cell.scope = 'col';
+      cell.textContent = label;
+      headerRow.appendChild(cell);
     });
+    tableHead.appendChild(headerRow);
+
+    const tableBody = document.createElement('tbody');
+    userList.users.forEach((user) => {
+      const row = tableBody.insertRow();
+      row.insertCell().textContent = user.name;
+      row.insertCell().textContent = user.email;
+      const roleCell = row.insertCell();
+      const roleNames = {
+        administrator: 'Owner',
+        document_owner: 'Document owner',
+        viewer: 'Viewer'
+      };
+      roleCell.textContent = roleNames[user.role] || user.role;
+      row.insertCell().textContent = user.status;
+
+      const actions = document.createElement('div');
+      actions.className = 'document-actions';
+
+      const ownerButton = document.createElement('button');
+      ownerButton.type = 'button';
+      ownerButton.dataset.action = 'set-role';
+      ownerButton.dataset.userId = user.id;
+      ownerButton.dataset.role = 'administrator';
+      ownerButton.textContent = 'Owner';
+      ownerButton.disabled = user.role === 'administrator';
+
+      const viewerButton = document.createElement('button');
+      viewerButton.type = 'button';
+      viewerButton.dataset.action = 'set-role';
+      viewerButton.dataset.userId = user.id;
+      viewerButton.dataset.role = 'viewer';
+      viewerButton.textContent = 'Viewer';
+      viewerButton.disabled = user.role === 'viewer' || user.id === window.currentUser.id;
+
+      const statusButton = document.createElement('button');
+      statusButton.type = 'button';
+      statusButton.dataset.action = 'toggle-status';
+      statusButton.dataset.userId = user.id;
+      statusButton.dataset.status = user.status === 'active' ? 'disabled' : 'active';
+      statusButton.textContent = user.status === 'active' ? 'Disable' : 'Enable';
+      statusButton.disabled = user.id === window.currentUser.id;
+
+      actions.append(ownerButton, viewerButton, statusButton);
+      const actionsCell = row.insertCell();
+      actionsCell.appendChild(actions);
+    });
+    table.append(tableHead, tableBody);
+    tableWrap.appendChild(table);
+    adminUsersList.replaceChildren(tableWrap);
 
     const auditList = document.getElementById('auditList');
     auditList.innerHTML = '';
     audit.audit.forEach((entry) => {
       const item = document.createElement('div');
       item.className = 'audit-entry';
-      item.innerHTML = `<strong>${entry.action}</strong><br /><small>${entry.actor_name || 'system'} • ${isoToFriendly(entry.created_at)}</small><div>${entry.details || ''}</div>`;
+
+      const eventName = document.createElement('strong');
+      eventName.textContent = entry.action;
+
+      const metadata = document.createElement('small');
+      metadata.textContent = `${entry.actor_name || 'system'} • ${isoToFriendly(entry.created_at)}`;
+
+      const details = document.createElement('div');
+      details.className = 'audit-details';
+      details.textContent = entry.details || 'No additional details';
+
+      item.append(eventName, metadata, details);
       auditList.appendChild(item);
     });
 
@@ -232,7 +420,7 @@ async function renderAdminData() {
         try {
           await API.request(`/api/admin/users/${userId}/role`, 'PUT', { role });
           showMessage(document.getElementById('uploadMessage'), 'Role updated', 'success');
-          renderAdminData();
+          await renderAdminData();
         } catch (error) {
           showMessage(document.getElementById('uploadMessage'), error.message, 'error');
         }
@@ -243,10 +431,14 @@ async function renderAdminData() {
       button.addEventListener('click', async () => {
         const userId = button.dataset.userId;
         const status = button.dataset.status;
+        if (status === 'disabled' && !window.confirm('Disable this user? They will lose access immediately.')) {
+          return;
+        }
         try {
           await API.request(`/api/admin/users/${userId}/status`, 'PUT', { status });
           showMessage(document.getElementById('uploadMessage'), 'Status updated', 'success');
-          renderAdminData();
+          await renderAdminData();
+          await loadUsersForShare();
         } catch (error) {
           showMessage(document.getElementById('uploadMessage'), error.message, 'error');
         }
@@ -261,9 +453,21 @@ async function setupDashboard() {
   const user = await loadCurrentUser();
   if (!user) return;
   window.currentUser = user;
-  document.getElementById('userBadge').textContent = `${user.name} (${user.role})`;
+  const roleNames = { administrator: 'Owner', document_owner: 'Document owner', viewer: 'Viewer' };
+  document.getElementById('userBadge').textContent = `${user.name} (${roleNames[user.role] || user.role})`;
+  if (!['administrator', 'document_owner'].includes(user.role)) {
+    document.getElementById('uploadPanel').classList.add('hidden');
+  }
 
   await loadUsersForShare();
+  if (['administrator', 'document_owner'].includes(user.role)) {
+    try {
+      await loadDocumentsForShare();
+      await renderSharePermissions();
+    } catch (error) {
+      showMessage(document.getElementById('shareMessage'), error.message, 'error');
+    }
+  }
   await renderDocuments();
   await renderAdminData();
 
@@ -281,13 +485,20 @@ async function setupDashboard() {
   });
 
   document.getElementById('nextPageBtn').addEventListener('click', async () => {
+    if (document.getElementById('nextPageBtn').disabled) return;
     window.currentPage = (window.currentPage || 1) + 1;
     await renderDocuments();
   });
 
+  document.getElementById('shareDocumentSelect').addEventListener('change', renderSharePermissions);
+
   document.getElementById('logoutBtn').addEventListener('click', async () => {
-    await API.request('/api/auth/logout', 'POST');
-    window.location.href = '/';
+    try {
+      await API.request('/api/auth/logout', 'POST');
+      window.location.href = '/';
+    } catch (error) {
+      showMessage(document.getElementById('uploadMessage'), error.message, 'error');
+    }
   });
 
   document.getElementById('uploadForm').addEventListener('submit', async (event) => {
@@ -314,7 +525,7 @@ async function setupDashboard() {
     const targetUserId = document.getElementById('shareUserSelect').value;
     const permission = document.getElementById('sharePermissionSelect').value;
     const expiresAt = document.getElementById('shareExpirationInput').value;
-    const docId = document.querySelector('[data-action="metadata"]')?.dataset.id;
+    const docId = document.getElementById('shareDocumentSelect').value;
 
     if (!docId) {
       showMessage(document.getElementById('shareMessage'), 'Select a document to share from the list.', 'error');
@@ -330,6 +541,23 @@ async function setupDashboard() {
         expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null
       });
       showMessage(document.getElementById('shareMessage'), 'Access granted successfully.', 'success');
+      await renderSharePermissions();
+    } catch (error) {
+      showMessage(document.getElementById('shareMessage'), error.message, 'error');
+    }
+  });
+
+  document.getElementById('sharedAccessList').addEventListener('click', async (event) => {
+    const button = event.target.closest('button[data-user-id]');
+    if (!button) return;
+
+    try {
+      await API.request(
+        `/api/documents/${document.getElementById('shareDocumentSelect').value}/share/${button.dataset.userId}`,
+        'DELETE'
+      );
+      showMessage(document.getElementById('shareMessage'), 'Access revoked successfully.', 'success');
+      await renderSharePermissions();
     } catch (error) {
       showMessage(document.getElementById('shareMessage'), error.message, 'error');
     }
@@ -358,6 +586,20 @@ async function setupDashboard() {
           `Created: ${isoToFriendly(document.created_at)}`
         ].join('\n');
         alert(details);
+      }
+
+      if (action === 'activity') {
+        const result = await API.request(`/api/documents/${id}/activity`);
+        const details = result.activity.map((entry) => {
+          let auditDetails = '';
+          try {
+            auditDetails = entry.details ? JSON.stringify(JSON.parse(entry.details)) : '';
+          } catch (_error) {
+            auditDetails = entry.details || '';
+          }
+          return `${entry.action} • ${entry.actor_name || 'system'} • ${isoToFriendly(entry.created_at)}${auditDetails ? ` • ${auditDetails}` : ''}`;
+        });
+        alert(details.length ? details.join('\n') : 'No activity recorded for this document.');
       }
 
       if (action === 'delete') {
