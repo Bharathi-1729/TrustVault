@@ -1,0 +1,41 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start Anime server",
+			"type": "shell",
+			"command": "node -v && npm -v && node server.js",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Start Node server",
+			"type": "shell",
+			"command": "node -v; npm -v; node server.js",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Run TrustVault tests",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"test"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Run TrustVault syntax checks",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
