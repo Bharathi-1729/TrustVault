@@ -21,7 +21,7 @@ async function getAvailablePort() {
   return port;
 }
 
-async function startServer(port, dataDir) {
+async function startServer(port, dataDir, envOverrides = {}) {
   const child = spawn(process.execPath, ['server.js'], {
     cwd: __dirname,
     env: {
@@ -31,7 +31,8 @@ async function startServer(port, dataDir) {
       TRUSTVAULT_DATA_DIR: dataDir,
       TRUSTVAULT_UPLOAD_DIR: path.join(dataDir, 'private_uploads'),
       TRUSTVAULT_SESSION_SECRET: 'test-only-session-secret-for-integration-tests',
-      TRUSTVAULT_AUDIT_SECRET: 'test-only-audit-secret-for-integration-tests'
+      TRUSTVAULT_AUDIT_SECRET: 'test-only-audit-secret-for-integration-tests',
+      ...envOverrides
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -69,6 +70,25 @@ function sessionCookie(response) {
   assert.ok(setCookie, 'authentication response should set a session cookie');
   return setCookie.split(';', 1)[0];
 }
+
+test('production server starts without a separate audit secret when session secret is configured', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'trustvault-production-start-'));
+  const port = await getAvailablePort();
+  let server;
+
+  try {
+    server = await startServer(port, dataDir, {
+      NODE_ENV: 'production',
+      TRUSTVAULT_SESSION_SECRET: 'production-session-secret-used-only-in-this-test',
+      TRUSTVAULT_AUDIT_SECRET: ''
+    });
+    const response = await fetch(`http://127.0.0.1:${port}/api/health`);
+    assert.equal(response.status, 200);
+  } finally {
+    if (server) await stopServer(server);
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
 
 test('dashboard browser script parses successfully', () => {
   const appScript = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
