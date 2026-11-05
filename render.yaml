@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: trustvault-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+      - key: ConnectionStrings__Default
+        value: Data Source=private-storage/trustvault.db
+      - key: Storage__Root
+        value: private-storage
+    disk:
+      name: trustvault-data
+      mountPath: /app/private-storage
+      sizeGB: 1
