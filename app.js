@@ -306,6 +306,7 @@ async function renderDocuments() {
       const actions = document.createElement('div');
       actions.className = 'document-actions';
       const availableActions = [
+        ['preview', 'Preview'],
         ['download', 'Download'],
         ['metadata', 'Details'],
         ['activity', 'Activity']
@@ -331,6 +332,37 @@ async function renderDocuments() {
 
   } catch (error) {
     showMessage(document.getElementById('uploadMessage'), error.message, 'error');
+  }
+}
+
+async function renderAccountActivity() {
+  const list = document.getElementById('accountActivityList');
+  if (!list) return;
+  try {
+    const result = await API.request('/api/account/activity?limit=30');
+    list.replaceChildren();
+    if (!result.activity.length) {
+      const empty = document.createElement('p');
+      empty.textContent = 'No account activity has been recorded yet.';
+      list.appendChild(empty);
+      return;
+    }
+
+    result.activity.forEach((entry) => {
+      const item = document.createElement('div');
+      item.className = 'audit-entry';
+      const action = document.createElement('strong');
+      action.textContent = entry.action;
+      const metadata = document.createElement('small');
+      metadata.textContent = `${entry.event_result || 'legacy'} • ${isoToFriendly(entry.created_at)}`;
+      const details = document.createElement('div');
+      details.className = 'audit-details';
+      details.textContent = entry.details || 'No additional details';
+      item.append(action, metadata, details);
+      list.appendChild(item);
+    });
+  } catch (error) {
+    showMessage(list, error.message, 'error');
   }
 }
 
@@ -573,6 +605,7 @@ async function setupDashboard() {
     }
   }
   await renderDocuments();
+  await renderAccountActivity();
   await renderAdminData();
 
   document.getElementById('searchForm').addEventListener('submit', async (event) => {
@@ -702,6 +735,10 @@ async function setupDashboard() {
     try {
       if (action === 'download') {
         window.open(`/api/documents/${id}/download`, '_blank');
+      }
+
+      if (action === 'preview') {
+        window.open(`/api/documents/${id}/preview`, '_blank', 'noopener,noreferrer');
       }
 
       if (action === 'metadata') {
