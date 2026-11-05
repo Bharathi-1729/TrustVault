@@ -144,6 +144,18 @@ button:hover {
   gap: 14px;
 }
 
+#searchForm,
+#adminAuditFilters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  align-items: end;
+}
+
+.filter-date {
+  min-width: 0;
+  font-size: 0.9rem;
+}
+
 label {
   display: flex;
   flex-direction: column;
@@ -434,7 +446,8 @@ textarea {
 .admin-users-table .document-actions button {
   flex: 1 1 76px;
   min-width: 0;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 button:disabled {
@@ -460,6 +473,10 @@ button:disabled {
   max-width: 100%;
   overflow-wrap: anywhere;
   white-space: normal;
+}
+
+.audit-entry button {
+  margin-top: 10px;
 }
 
 .audit-entry strong {
