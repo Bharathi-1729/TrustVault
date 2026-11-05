@@ -53,7 +53,7 @@ Endpoints.Map(app);
 using (var scope = app.Services.CreateScope()) {            // MVP: EnsureCreated. Switch to EF migrations before real use.
     var db = scope.ServiceProvider.GetRequiredService<AppDb>();
     await db.Database.EnsureCreatedAsync();
-    if (app.Environment.IsDevelopment() && !await db.Users.AnyAsync()) {
+    if (!await db.Users.AnyAsync()) {
         var h = scope.ServiceProvider.GetRequiredService<IPasswordHasher<User>>();
         void Add(string e, string n, GlobalRole r, string pw) { var u = new User { Email = e, DisplayName = n, GlobalRole = r }; u.PasswordHash = h.HashPassword(u, pw); db.Users.Add(u); }
         Add("admin@trustvault.local", "Admin", GlobalRole.Admin, "Admin#12345");
