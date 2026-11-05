@@ -11,7 +11,3 @@ services:
         value: Data Source=private-storage/trustvault.db
       - key: Storage__Root
         value: private-storage
-    disk:
-      name: trustvault-data
-      mountPath: /app/private-storage
-      sizeGB: 1
