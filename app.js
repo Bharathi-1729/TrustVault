@@ -89,8 +89,14 @@ function bindAuthTabs() {
     const payload = {
       name: formData.get('name'),
       email: formData.get('email'),
-      password: formData.get('password')
+      password: formData.get('password'),
+      confirmPassword: formData.get('confirmPassword')
     };
+
+    if (payload.password !== payload.confirmPassword) {
+      showMessage(document.getElementById('authMessage'), 'Password confirmation does not match.', 'error');
+      return;
+    }
 
     try {
       await API.request('/api/auth/register', 'POST', payload);
@@ -226,10 +232,30 @@ async function renderDocuments() {
 
   const page = Math.max(1, Math.floor(Number(window.currentPage) || 1));
   const search = document.getElementById('searchInput')?.value || '';
+  const filters = new URLSearchParams({
+    limit: '5',
+    page: String(page),
+    search,
+    category: document.getElementById('categoryFilter')?.value || '',
+    ownerId: document.getElementById('ownerFilter')?.value || '',
+    fileType: document.getElementById('fileTypeFilter')?.value || '',
+    dateFrom: document.getElementById('dateFromFilter')?.value || '',
+    dateTo: document.getElementById('dateToFilter')?.value || ''
+  });
 
   try {
-    const result = await API.request(`/api/documents?limit=5&page=${page}&search=${encodeURIComponent(search)}`);
+    const result = await API.request(`/api/documents?${filters}`);
     documentList.innerHTML = '';
+    if (window.currentUser.role !== 'administrator') {
+      document.getElementById('documentCount').textContent = result.total;
+    }
+    const ownerFilter = document.getElementById('ownerFilter');
+    const selectedOwner = ownerFilter.value;
+    ownerFilter.replaceChildren(new Option('All owners', ''));
+    result.owners.forEach((owner) => {
+      ownerFilter.appendChild(new Option(owner.name, owner.id));
+    });
+    if (result.owners.some((owner) => owner.id === selectedOwner)) ownerFilter.value = selectedOwner;
 
     const pageLabel = document.getElementById('pageLabel');
     const totalPages = Math.max(result.totalPages || 1, 1);
@@ -275,7 +301,7 @@ async function renderDocuments() {
 
       const metadata = document.createElement('div');
       metadata.className = 'doc-meta';
-      metadata.textContent = `${doc.description || 'No description'} • ${isoToFriendly(doc.created_at)} • ${doc.size_bytes || 0} bytes`;
+      metadata.textContent = `${doc.description || 'No description'} • ${doc.mime_type || 'Unknown type'} • ${isoToFriendly(doc.created_at)} • ${doc.size_bytes || 0} bytes`;
 
       const actions = document.createElement('div');
       actions.className = 'document-actions';
@@ -285,7 +311,10 @@ async function renderDocuments() {
         ['activity', 'Activity']
       ];
       if (doc.owner_id === window.currentUser.id && window.currentUser.role !== 'viewer') {
+        availableActions.push(['edit', 'Edit']);
         availableActions.push(['delete', 'Delete']);
+      } else if (['edit', 'owner'].includes(doc.accessLevel)) {
+        availableActions.push(['edit', 'Edit']);
       }
       for (const [action, label] of availableActions) {
         const button = document.createElement('button');
@@ -315,17 +344,32 @@ async function renderAdminData() {
   }
 
   adminSection.classList.remove('hidden');
+  document.querySelectorAll('.admin-only').forEach((stat) => stat.classList.remove('hidden'));
 
   try {
+    const auditFilters = new URLSearchParams({
+      limit: '50',
+      action: document.getElementById('auditActionFilter')?.value || '',
+      user: document.getElementById('auditUserFilter')?.value || '',
+      document: document.getElementById('auditDocumentFilter')?.value || '',
+      dateFrom: document.getElementById('auditDateFrom')?.value || '',
+      dateTo: document.getElementById('auditDateTo')?.value || '',
+      result: document.getElementById('auditResultFilter')?.value || ''
+    });
     const [dashboard, audit] = await Promise.all([
       API.request('/api/admin/dashboard'),
-      API.request('/api/admin/audit?limit=10')
+      API.request(`/api/admin/audit?${auditFilters}`)
     ]);
 
     document.getElementById('userCount').textContent = dashboard.counts.users;
     document.getElementById('documentCount').textContent = dashboard.counts.documents;
-    document.getElementById('adminCount').textContent = dashboard.counts.administrators;
-    document.getElementById('auditCount').textContent = audit.audit.length;
+    document.getElementById('activeUserCount').textContent = dashboard.counts.activeUsers;
+    document.getElementById('adminCount').textContent = dashboard.counts.disabledUsers;
+    document.getElementById('sharedDocumentCount').textContent = dashboard.counts.sharedDocuments;
+    document.getElementById('downloadCount').textContent = dashboard.counts.totalDownloads;
+    document.getElementById('permissionChangeCount').textContent = dashboard.counts.permissionChanges;
+    document.getElementById('failedLoginCount').textContent = dashboard.counts.failedLogins;
+    document.getElementById('deniedAccessCount').textContent = dashboard.counts.deniedAccessAttempts;
 
     const adminUsersList = document.getElementById('adminUsersList');
     const userList = dashboard.counts.users ? await API.request('/api/admin/users') : { users: [] };
@@ -369,6 +413,14 @@ async function renderAdminData() {
       ownerButton.textContent = 'Owner';
       ownerButton.disabled = user.role === 'administrator';
 
+      const documentOwnerButton = document.createElement('button');
+      documentOwnerButton.type = 'button';
+      documentOwnerButton.dataset.action = 'set-role';
+      documentOwnerButton.dataset.userId = user.id;
+      documentOwnerButton.dataset.role = 'document_owner';
+      documentOwnerButton.textContent = 'Document owner';
+      documentOwnerButton.disabled = user.role === 'document_owner';
+
       const viewerButton = document.createElement('button');
       viewerButton.type = 'button';
       viewerButton.dataset.action = 'set-role';
@@ -385,13 +437,42 @@ async function renderAdminData() {
       statusButton.textContent = user.status === 'active' ? 'Disable' : 'Enable';
       statusButton.disabled = user.id === window.currentUser.id;
 
-      actions.append(ownerButton, viewerButton, statusButton);
+      actions.append(ownerButton, documentOwnerButton, viewerButton, statusButton);
       const actionsCell = row.insertCell();
       actionsCell.appendChild(actions);
     });
     table.append(tableHead, tableBody);
     tableWrap.appendChild(table);
     adminUsersList.replaceChildren(tableWrap);
+
+    const uploadsList = document.getElementById('adminRecentUploadsList');
+    uploadsList.replaceChildren();
+    dashboard.recentUploads.forEach((upload) => {
+      const item = document.createElement('div');
+      item.className = 'audit-entry';
+      const title = document.createElement('strong');
+      title.textContent = upload.name;
+      const metadata = document.createElement('small');
+      metadata.textContent = `${upload.owner_name} • ${upload.category} • ${isoToFriendly(upload.created_at)} • ${upload.scan_status}`;
+      item.append(title, metadata);
+      if (upload.scan_status === 'pending') {
+        const approveButton = document.createElement('button');
+        approveButton.type = 'button';
+        approveButton.className = 'secondary-btn';
+        approveButton.textContent = 'Approve for download';
+        approveButton.addEventListener('click', async () => {
+          if (!window.confirm('Confirm that this document has been reviewed and may be downloaded?')) return;
+          try {
+            await API.request(`/api/admin/documents/${upload.id}/scan`, 'POST', { status: 'approved' });
+            await renderAdminData();
+          } catch (error) {
+            showMessage(document.getElementById('uploadMessage'), error.message, 'error');
+          }
+        });
+        item.appendChild(approveButton);
+      }
+      uploadsList.appendChild(item);
+    });
 
     const auditList = document.getElementById('auditList');
     auditList.innerHTML = '';
@@ -403,13 +484,16 @@ async function renderAdminData() {
       eventName.textContent = entry.action;
 
       const metadata = document.createElement('small');
-      metadata.textContent = `${entry.actor_name || 'system'} • ${isoToFriendly(entry.created_at)}`;
+      metadata.textContent = `${entry.actor_name || 'system'} • ${isoToFriendly(entry.created_at)} • ${entry.event_result || 'legacy'}`;
 
       const details = document.createElement('div');
       details.className = 'audit-details';
       details.textContent = entry.details || 'No additional details';
 
-      item.append(eventName, metadata, details);
+      const requestAgent = document.createElement('small');
+      requestAgent.textContent = entry.user_agent || 'Unknown client';
+
+      item.append(eventName, metadata, requestAgent, details);
       auditList.appendChild(item);
     });
 
@@ -457,6 +541,26 @@ async function setupDashboard() {
   document.getElementById('userBadge').textContent = `${user.name} (${roleNames[user.role] || user.role})`;
   if (!['administrator', 'document_owner'].includes(user.role)) {
     document.getElementById('uploadPanel').classList.add('hidden');
+    document.getElementById('categoryPanel').classList.add('hidden');
+  } else {
+    document.getElementById('categoryPanel').classList.remove('hidden');
+  }
+
+  try {
+    const { categories } = await API.request('/api/categories');
+    const datalist = document.getElementById('categoryOptions');
+    const categoryFilter = document.getElementById('categoryFilter');
+    categories.forEach((name) => {
+      const option = document.createElement('option');
+      option.value = name;
+      datalist.appendChild(option);
+      const filterOption = document.createElement('option');
+      filterOption.value = name;
+      filterOption.textContent = name;
+      categoryFilter.appendChild(filterOption);
+    });
+  } catch (error) {
+    showMessage(document.getElementById('categoryMessage'), error.message, 'error');
   }
 
   await loadUsersForShare();
@@ -475,6 +579,31 @@ async function setupDashboard() {
     event.preventDefault();
     window.currentPage = 1;
     await renderDocuments();
+  });
+
+  document.getElementById('categoryForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      const { category } = await API.request('/api/categories', 'POST', {
+        name: document.getElementById('categoryNameInput').value
+      });
+      document.getElementById('categoryForm').reset();
+      const suggestion = document.createElement('option');
+      suggestion.value = category.name;
+      document.getElementById('categoryOptions').appendChild(suggestion);
+      const filterOption = document.createElement('option');
+      filterOption.value = category.name;
+      filterOption.textContent = category.name;
+      document.getElementById('categoryFilter').appendChild(filterOption);
+      showMessage(document.getElementById('categoryMessage'), 'Category created.', 'success');
+    } catch (error) {
+      showMessage(document.getElementById('categoryMessage'), error.message, 'error');
+    }
+  });
+
+  document.getElementById('adminAuditFilters').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    await renderAdminData();
   });
 
   document.getElementById('prevPageBtn').addEventListener('click', async () => {
@@ -603,7 +732,21 @@ async function setupDashboard() {
       }
 
       if (action === 'delete') {
+        if (!window.confirm('Delete this document? This removes future access for all users.')) return;
         await API.request(`/api/documents/${id}`, 'DELETE');
+        await renderDocuments();
+      }
+
+      if (action === 'edit') {
+        const result = await API.request(`/api/documents/${id}`);
+        const current = result.document;
+        const name = window.prompt('Document name', current.name);
+        if (name === null) return;
+        const category = window.prompt('Category', current.category);
+        if (category === null) return;
+        const description = window.prompt('Description', current.description || '');
+        if (description === null) return;
+        await API.request(`/api/documents/${id}`, 'PUT', { name, category, description });
         await renderDocuments();
       }
     } catch (error) {
