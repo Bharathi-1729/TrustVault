@@ -205,6 +205,16 @@ test('registration, bcrypt login, sessions, and SQLite persistence work', async 
     });
     assert.equal(download.status, 200);
     assert.equal(await download.text(), 'TrustVault upload test – café');
+    const preview = await fetch(`${baseUrl}/api/documents/${uploadedDocument.id}/preview`, {
+      headers: { cookie }
+    });
+    assert.equal(preview.status, 200);
+    assert.match(preview.headers.get('content-type'), /^text\/plain(?:;|$)/);
+    assert.match(preview.headers.get('content-security-policy'), /sandbox/);
+    assert.equal(await preview.text(), 'TrustVault upload test – café');
+    const ownActivity = await fetch(`${baseUrl}/api/account/activity`, { headers: { cookie } });
+    assert.equal(ownActivity.status, 200);
+    assert.ok((await ownActivity.json()).activity.some((entry) => entry.action === 'document_previewed'));
     const uploadAudit = await fetch(`${baseUrl}/api/admin/audit`, {
       headers: { cookie }
     });
@@ -534,6 +544,10 @@ test('Owner and Viewer authorization, document sharing, and disabled sessions ar
       headers: { cookie: secondViewerCookie }
     });
     assert.equal(revokedViewerAccess.status, 403);
+    const revokedViewerPreview = await fetch(`${baseUrl}/api/documents/${documentId}/preview`, {
+      headers: { cookie: secondViewerCookie }
+    });
+    assert.equal(revokedViewerPreview.status, 403);
 
     const setSecondDocumentOwner = await postJson(`/api/admin/users/${secondViewer.id}/role`, ownerCookie, {
       role: 'document_owner'
