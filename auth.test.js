@@ -8,6 +8,7 @@ const net = require('node:net');
 const vm = require('node:vm');
 const bcrypt = require('bcryptjs');
 const Database = require('better-sqlite3');
+const TEST_PASSWORD = 'Valid-test-Password1!';
 
 async function getAvailablePort() {
   const server = net.createServer();
@@ -29,7 +30,8 @@ async function startServer(port, dataDir) {
       PORT: String(port),
       TRUSTVAULT_DATA_DIR: dataDir,
       TRUSTVAULT_UPLOAD_DIR: path.join(dataDir, 'private_uploads'),
-      TRUSTVAULT_SESSION_SECRET: 'test-only-session-secret-for-integration-tests'
+      TRUSTVAULT_SESSION_SECRET: 'test-only-session-secret-for-integration-tests',
+      TRUSTVAULT_AUDIT_SECRET: 'test-only-audit-secret-for-integration-tests'
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -88,7 +90,8 @@ test('registration, bcrypt login, sessions, and SQLite persistence work', async 
       body: JSON.stringify({
         name: 'Auth Test User',
         email: '  AUTH-Test@example.invalid  ',
-        password: 'valid-test-password'
+        password: TEST_PASSWORD,
+        confirmPassword: TEST_PASSWORD
       })
     });
     assert.equal(registration.status, 201);
@@ -101,8 +104,8 @@ test('registration, bcrypt login, sessions, and SQLite persistence work', async 
     const database = new Database(path.join(dataDir, 'trustvault.db'), { readonly: true });
     const user = database.prepare('SELECT password_hash FROM users WHERE email = ?').get('auth-test@example.invalid');
     assert.ok(user);
-    assert.notEqual(user.password_hash, 'valid-test-password');
-    assert.equal(bcrypt.compareSync('valid-test-password', user.password_hash), true);
+    assert.notEqual(user.password_hash, TEST_PASSWORD);
+    assert.equal(bcrypt.compareSync(TEST_PASSWORD, user.password_hash), true);
     database.close();
 
     const currentUser = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie } });
@@ -124,6 +127,34 @@ test('registration, bcrypt login, sessions, and SQLite persistence work', async 
       body: JSON.stringify({ password: 12345678 })
     });
     assert.equal(invalidProfilePassword.status, 400);
+    const weakRegistration = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Weak Password User',
+        email: 'weak-password@example.invalid',
+        password: 'all-lowercase',
+        confirmPassword: 'all-lowercase'
+      })
+    });
+    assert.equal(weakRegistration.status, 400);
+    const mismatchedRegistration = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Password Mismatch User',
+        email: 'mismatch@example.invalid',
+        password: TEST_PASSWORD,
+        confirmPassword: `${TEST_PASSWORD}different`
+      })
+    });
+    assert.equal(mismatchedRegistration.status, 400);
+    const crossOriginUpdate = await fetch(`${baseUrl}/api/profile`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie, origin: 'https://untrusted.example' },
+      body: JSON.stringify({ name: 'Cross-site Change' })
+    });
+    assert.equal(crossOriginUpdate.status, 403);
 
     const formData = new FormData();
     formData.append('file', new Blob(['TrustVault upload test – café'], { type: 'text/plain' }), 'upload-test.txt');
@@ -176,7 +207,7 @@ test('registration, bcrypt login, sessions, and SQLite persistence work', async 
 
     const invalidLogin = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'user-agent': 'trustvault-test-agent' },
       body: JSON.stringify({ email: 'AUTH-TEST@example.invalid', password: 'incorrect-password' })
     });
     assert.equal(invalidLogin.status, 401);
@@ -185,10 +216,17 @@ test('registration, bcrypt login, sessions, and SQLite persistence work', async 
     const validLogin = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'AUTH-TEST@example.invalid', password: 'valid-test-password' })
+      body: JSON.stringify({ email: 'AUTH-TEST@example.invalid', password: TEST_PASSWORD })
     });
     assert.equal(validLogin.status, 200);
     cookie = sessionCookie(validLogin);
+    const failedLoginAudit = await fetch(`${baseUrl}/api/admin/audit?action=user_login_failed&result=failure`, {
+      headers: { cookie }
+    });
+    const failedLoginEvents = (await failedLoginAudit.json()).audit;
+    assert.ok(failedLoginEvents.some(
+      (entry) => entry.event_result === 'failure' && entry.user_agent === 'trustvault-test-agent'
+    ));
 
     await stopServer(server);
     server = await startServer(port, dataDir);
@@ -196,7 +234,7 @@ test('registration, bcrypt login, sessions, and SQLite persistence work', async 
     const loginAfterRestart = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'auth-test@example.invalid', password: 'valid-test-password' })
+      body: JSON.stringify({ email: 'auth-test@example.invalid', password: TEST_PASSWORD })
     });
     assert.equal(loginAfterRestart.status, 200);
     assert.equal((await loginAfterRestart.json()).user.email, 'auth-test@example.invalid');
@@ -208,6 +246,14 @@ test('registration, bcrypt login, sessions, and SQLite persistence work', async 
     const restoredSession = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie } });
     assert.equal(restoredSession.status, 200);
     assert.equal((await restoredSession.json()).user.email, 'auth-test@example.invalid');
+
+    const appendOnlyDb = new Database(path.join(dataDir, 'trustvault.db'));
+    assert.throws(() => appendOnlyDb.prepare("UPDATE audit_events SET action = 'rewritten'").run(), /append-only/);
+    appendOnlyDb.exec('DROP TRIGGER audit_events_no_update');
+    appendOnlyDb.prepare("UPDATE audit_events SET details = ? WHERE action = 'user_login_failed'").run('{"tampered":true}');
+    appendOnlyDb.close();
+    const tamperedAudit = await fetch(`${baseUrl}/api/admin/audit`, { headers: { cookie } });
+    assert.equal((await tamperedAudit.json()).integrity.valid, false);
   } finally {
     if (server) await stopServer(server);
     fs.rmSync(dataDir, { recursive: true, force: true });
@@ -231,7 +277,8 @@ test('Owner and Viewer authorization, document sharing, and disabled sessions ar
     const response = await postJson('/api/auth/register', null, {
       name,
       email,
-      password: 'valid-test-password'
+      password: TEST_PASSWORD,
+      confirmPassword: TEST_PASSWORD
     });
     assert.equal(response.status, 201);
     return sessionCookie(response);
@@ -249,6 +296,12 @@ test('Owner and Viewer authorization, document sharing, and disabled sessions ar
     const ownerCookie = await register('owner@example.invalid', 'Owner User');
     const viewerCookie = await register('viewer@example.invalid', 'Viewer User');
     const secondViewerCookie = await register('second-viewer@example.invalid', 'Second Viewer');
+    const categoryCreated = await postJson('/api/categories', ownerCookie, { name: 'Contracts' });
+    assert.equal(categoryCreated.status, 201);
+    const duplicateCategory = await postJson('/api/categories', ownerCookie, { name: 'contracts' });
+    assert.equal(duplicateCategory.status, 409);
+    const viewerCategoryAttempt = await postJson('/api/categories', viewerCookie, { name: 'Private' });
+    assert.equal(viewerCategoryAttempt.status, 403);
 
     const usersResponse = await fetch(`${baseUrl}/api/admin/users`, {
       headers: { cookie: ownerCookie }
@@ -266,7 +319,8 @@ test('Owner and Viewer authorization, document sharing, and disabled sessions ar
     const duplicateRegistration = await postJson('/api/auth/register', null, {
       name: 'Duplicate User',
       email: 'VIEWER@example.invalid',
-      password: 'valid-test-password'
+      password: TEST_PASSWORD,
+      confirmPassword: TEST_PASSWORD
     });
     assert.equal(duplicateRegistration.status, 409);
 
@@ -363,6 +417,27 @@ test('Owner and Viewer authorization, document sharing, and disabled sessions ar
       permission: 'read'
     });
     assert.equal(grant.status, 201);
+    const permissionConstraintDb = new Database(path.join(dataDir, 'trustvault.db'));
+    assert.throws(() => permissionConstraintDb.prepare(`
+      INSERT INTO document_permissions(
+        id, document_id, user_id, permission, active, expires_at,
+        created_by, created_at, updated_at, revoked_at
+      ) VALUES (?, ?, ?, 'read', 1, NULL, ?, ?, ?, NULL)
+    `).run(
+      'duplicate-active-permission',
+      documentId,
+      secondViewer.id,
+      viewer.id,
+      new Date().toISOString(),
+      new Date().toISOString()
+    ), /UNIQUE constraint failed/);
+    permissionConstraintDb.close();
+    const expiredGrant = await postJson(`/api/documents/${documentId}/share`, viewerCookie, {
+      email: 'second-viewer@example.invalid',
+      permission: 'read',
+      expiresAt: '2020-01-01T00:00:00.000Z'
+    });
+    assert.equal(expiredGrant.status, 400);
     const ownerShares = await fetch(`${baseUrl}/api/documents/${documentId}/shares`, {
       headers: { cookie: ownerCookie }
     });
@@ -378,13 +453,22 @@ test('Owner and Viewer authorization, document sharing, and disabled sessions ar
     });
     assert.equal(sharedDocs.status, 200);
     assert.equal((await sharedDocs.json()).documents[0].id, documentId);
+    const filteredSharedDocs = await fetch(`${baseUrl}/api/documents?fileType=text%2Fplain&category=test`, {
+      headers: { cookie: secondViewerCookie }
+    });
+    assert.equal(filteredSharedDocs.status, 200);
+    assert.equal((await filteredSharedDocs.json()).documents[0].id, documentId);
     const viewerActivity = await fetch(`${baseUrl}/api/documents/${documentId}/activity`, {
       headers: { cookie: secondViewerCookie }
     });
     assert.equal(viewerActivity.status, 200);
-    assert.ok((await viewerActivity.json()).activity.some(
-      (entry) => entry.action === 'document_permission_granted'
+    const viewerActivityEvents = (await viewerActivity.json()).activity;
+    assert.ok(viewerActivityEvents.some(
+      (entry) => entry.action === 'document_activity_viewed'
     ));
+    assert.equal(viewerActivityEvents.some(
+      (entry) => entry.action === 'document_permission_granted'
+    ), false);
 
     const viewerPermissionDetails = await fetch(`${baseUrl}/api/documents/${documentId}`, {
       headers: { cookie: secondViewerCookie }
@@ -488,7 +572,8 @@ test('Owner and Viewer authorization, document sharing, and disabled sessions ar
     assert.equal(disabledCurrentUser.status, 403);
     const disabledLogin = await postJson('/api/auth/login', null, {
       email: 'second-viewer@example.invalid',
-      password: 'valid-test-password'
+      password: TEST_PASSWORD,
+      confirmPassword: TEST_PASSWORD
     });
     assert.equal(disabledLogin.status, 403);
 
@@ -498,7 +583,8 @@ test('Owner and Viewer authorization, document sharing, and disabled sessions ar
     assert.equal(enable.status, 200);
     const enabledLogin = await postJson('/api/auth/login', null, {
       email: 'SECOND-VIEWER@example.invalid',
-      password: 'valid-test-password'
+      password: TEST_PASSWORD,
+      confirmPassword: TEST_PASSWORD
     });
     assert.equal(enabledLogin.status, 200);
 
@@ -509,6 +595,13 @@ test('Owner and Viewer authorization, document sharing, and disabled sessions ar
     const auditBody = await auditResponse.json();
     assert.equal(auditBody.integrity.valid, true);
     assert.ok(auditBody.audit.some((entry) => entry.action === 'authorization_denied'));
+    const dashboardResponse = await fetch(`${baseUrl}/api/admin/dashboard`, {
+      headers: { cookie: ownerCookie }
+    });
+    const dashboard = await dashboardResponse.json();
+    assert.equal(dashboard.counts.users, 3);
+    assert.equal(dashboard.counts.activeUsers, 3);
+    assert.ok(dashboard.counts.permissionChanges >= 2);
   } finally {
     if (server) await stopServer(server);
     fs.rmSync(dataDir, { recursive: true, force: true });
@@ -535,7 +628,7 @@ test('legacy user tables gain missing role and status columns without losing acc
     'legacy-user',
     'Legacy User',
     'legacy@example.invalid',
-    bcrypt.hashSync('valid-test-password', 12),
+    bcrypt.hashSync(TEST_PASSWORD, 12),
     new Date().toISOString(),
     new Date().toISOString()
   );
@@ -551,7 +644,8 @@ test('legacy user tables gain missing role and status columns without losing acc
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         email: 'LEGACY@example.invalid',
-        password: 'valid-test-password'
+        password: TEST_PASSWORD,
+        confirmPassword: TEST_PASSWORD
       })
     });
     assert.equal(login.status, 200);
