@@ -41,7 +41,7 @@
         </div>
       </section>
 
-      <section class="panel">
+      <section id="uploadPanel" class="panel">
         <h2>Upload document</h2>
         <form id="uploadForm" enctype="multipart/form-data">
           <label>
@@ -81,12 +81,16 @@
         <div id="documentList" class="document-list"></div>
       </section>
 
-      <section class="panel">
+      <section id="sharePanel" class="panel">
         <h2>Share access</h2>
         <form id="shareForm">
           <label>
+            Document
+            <select id="shareDocumentSelect" required></select>
+          </label>
+          <label>
             User
-            <select id="shareUserSelect"></select>
+            <select id="shareUserSelect" required></select>
           </label>
           <label>
             Permission
@@ -102,11 +106,15 @@
           <button type="submit" class="primary-btn">Grant access</button>
         </form>
         <div id="shareMessage" class="status-message" aria-live="polite"></div>
+        <h3>Current access</h3>
+        <div id="sharedAccessList" class="shared-access-list"></div>
       </section>
 
       <section id="adminSection" class="panel hidden">
         <h2>Administrative controls</h2>
+        <h3>Registered users</h3>
         <div id="adminUsersList" class="admin-list"></div>
+        <h3>Recent audit activity</h3>
         <div id="auditList" class="audit-list"></div>
       </section>
     </main>
