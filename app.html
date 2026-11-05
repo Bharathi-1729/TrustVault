@@ -26,17 +26,37 @@
             <span>Documents</span>
             <strong id="documentCount">0</strong>
           </div>
-          <div class="stat-card">
-            <span>Users</span>
+          <div class="stat-card admin-only hidden">
+            <span>Total users</span>
             <strong id="userCount">0</strong>
           </div>
-          <div class="stat-card">
-            <span>Admins</span>
+          <div class="stat-card admin-only hidden">
+            <span>Active users</span>
+            <strong id="activeUserCount">0</strong>
+          </div>
+          <div class="stat-card admin-only hidden">
+            <span>Disabled users</span>
             <strong id="adminCount">0</strong>
           </div>
-          <div class="stat-card">
-            <span>Audit events</span>
-            <strong id="auditCount">0</strong>
+          <div class="stat-card admin-only hidden">
+            <span>Shared documents</span>
+            <strong id="sharedDocumentCount">0</strong>
+          </div>
+          <div class="stat-card admin-only hidden">
+            <span>Downloads</span>
+            <strong id="downloadCount">0</strong>
+          </div>
+          <div class="stat-card admin-only hidden">
+            <span>Permission changes</span>
+            <strong id="permissionChangeCount">0</strong>
+          </div>
+          <div class="stat-card admin-only hidden">
+            <span>Failed sign-ins</span>
+            <strong id="failedLoginCount">0</strong>
+          </div>
+          <div class="stat-card admin-only hidden">
+            <span>Denied requests</span>
+            <strong id="deniedAccessCount">0</strong>
           </div>
         </div>
       </section>
@@ -50,7 +70,8 @@
           </label>
           <label>
             Category
-            <input type="text" id="categoryInput" name="category" placeholder="contracts, payroll, legal" />
+            <input type="text" id="categoryInput" name="category" list="categoryOptions" placeholder="contracts, payroll, legal" />
+            <datalist id="categoryOptions"></datalist>
           </label>
           <label>
             Description
@@ -65,8 +86,34 @@
         <h2>Search documents</h2>
         <form id="searchForm" class="inline-form">
           <input type="search" id="searchInput" placeholder="Search by name, owner, category, date" />
+          <select id="categoryFilter" aria-label="Filter by category">
+            <option value="">All categories</option>
+          </select>
+          <select id="ownerFilter" aria-label="Filter by owner">
+            <option value="">All owners</option>
+          </select>
+          <select id="fileTypeFilter" aria-label="Filter by file type">
+            <option value="">All file types</option>
+            <option value="application/pdf">PDF</option>
+            <option value="application/vnd.openxmlformats-officedocument.wordprocessingml.document">DOCX</option>
+            <option value="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">XLSX</option>
+            <option value="image/jpeg">JPEG</option>
+            <option value="image/png">PNG</option>
+            <option value="text/plain">Text</option>
+          </select>
+          <label class="filter-date">From <input type="date" id="dateFromFilter" /></label>
+          <label class="filter-date">To <input type="date" id="dateToFilter" /></label>
           <button type="submit" class="secondary-btn">Search</button>
         </form>
+      </section>
+
+      <section id="categoryPanel" class="panel hidden">
+        <h2>Manage categories</h2>
+        <form id="categoryForm" class="inline-form">
+          <input type="text" id="categoryNameInput" maxlength="64" placeholder="New category name" required />
+          <button type="submit" class="secondary-btn">Create category</button>
+        </form>
+        <div id="categoryMessage" class="status-message" aria-live="polite"></div>
       </section>
 
       <section class="panel wide-panel">
@@ -114,7 +161,23 @@
         <h2>Administrative controls</h2>
         <h3>Registered users</h3>
         <div id="adminUsersList" class="admin-list"></div>
+        <h3>Recent uploads</h3>
+        <div id="adminRecentUploadsList" class="admin-list"></div>
         <h3>Recent audit activity</h3>
+        <form id="adminAuditFilters" class="inline-form audit-filters">
+          <input type="search" id="auditActionFilter" placeholder="Action" aria-label="Filter by action" />
+          <input type="search" id="auditUserFilter" placeholder="User" aria-label="Filter by user" />
+          <input type="search" id="auditDocumentFilter" placeholder="Document" aria-label="Filter by document" />
+          <label class="filter-date">From <input type="date" id="auditDateFrom" /></label>
+          <label class="filter-date">To <input type="date" id="auditDateTo" /></label>
+          <select id="auditResultFilter" aria-label="Filter by result">
+            <option value="">All results</option>
+            <option value="success">Success</option>
+            <option value="failure">Failure</option>
+            <option value="denied">Denied</option>
+          </select>
+          <button type="submit" class="secondary-btn">Filter audit</button>
+        </form>
         <div id="auditList" class="audit-list"></div>
       </section>
     </main>
