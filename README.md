@@ -38,7 +38,7 @@ The first registered user becomes the administrator automatically. There is no d
 - **Document owner** users can upload documents and manage sharing for documents they own.
 - **Viewer** users can only access documents explicitly shared with them.
 - Public registration requires a matching confirmation and a password of at least 8 characters containing uppercase and lowercase letters, a number, and a symbol. Existing accounts can continue to log in with their existing passwords.
-- Set distinct, stable `TRUSTVAULT_SESSION_SECRET` and `TRUSTVAULT_AUDIT_SECRET` values of at least 32 characters in production. Startup is rejected if either production secret is missing or too short. Set the audit secret consistently across restarts or audit signatures will not verify.
+- Set a stable `TRUSTVAULT_SESSION_SECRET` of at least 32 characters in production. A separate stable `TRUSTVAULT_AUDIT_SECRET` is recommended; if it is omitted, the audit signatures use the session secret for backward-compatible deployment. Keep the chosen secret stable across restarts or audit signatures will not verify.
 - State-changing requests with an `Origin` or `Referer` header are restricted to the same origin. Session cookies are HttpOnly, SameSite=Lax, and Secure in production.
 - Users whose role or status changes are checked against SQLite on each protected request, so disabling an account or removing its role takes effect immediately.
 - Older user tables are migrated additively: missing role/status columns are added without deleting records, and the earliest existing account becomes Owner if no role column existed.
@@ -50,7 +50,7 @@ The first registered user becomes the administrator automatically. There is no d
 - Database state is stored in `data/trustvault.db`.
 - For persistent hosting, set `TRUSTVAULT_DATA_DIR` to the mounted persistent disk directory. For example, on a Render disk mounted at `/var/data`, set `TRUSTVAULT_DATA_DIR=/var/data`.
 - To persist uploaded documents on Render too, set `TRUSTVAULT_UPLOAD_DIR` to a directory on that disk, such as `/var/data/private_uploads`.
-- Render service start command: `npm start`. Attach a persistent disk at `/var/data` and configure `TRUSTVAULT_DATA_DIR=/var/data`, `TRUSTVAULT_UPLOAD_DIR=/var/data/private_uploads`, `TRUSTVAULT_SESSION_SECRET`, and `TRUSTVAULT_AUDIT_SECRET` in the service environment. Back up the existing database and private upload directory before deploying schema migrations.
+- Render service start command: `npm start`. Attach a persistent disk at `/var/data` and configure `TRUSTVAULT_DATA_DIR=/var/data`, `TRUSTVAULT_UPLOAD_DIR=/var/data/private_uploads`, and `TRUSTVAULT_SESSION_SECRET` in the service environment. Add `TRUSTVAULT_AUDIT_SECRET` as a separate secret when possible; it safely falls back to the session secret if omitted. Back up the existing database and private upload directory before deploying schema migrations.
 - File extensions can be restricted with `TRUSTVAULT_ALLOWED_EXTENSIONS`, a comma-separated subset of `.pdf,.png,.jpg,.jpeg,.txt,.docx,.xlsx`. The server validates signatures and Office ZIP contents; browser MIME headers are not trusted.
 - The project deliberately does not expose public file URLs.
 
