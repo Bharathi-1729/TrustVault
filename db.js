@@ -10,6 +10,9 @@ const dbPath = path.join(dataDir, 'trustvault.db');
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+const auditSecret = process.env.TRUSTVAULT_AUDIT_SECRET
+  || process.env.TRUSTVAULT_SESSION_SECRET
+  || crypto.randomBytes(32).toString('hex');
 
 function nowIso() {
   return new Date().toISOString();
@@ -101,7 +104,19 @@ function initializeDatabase() {
       ip TEXT,
       created_at TEXT NOT NULL,
       prev_hash TEXT NOT NULL,
-      hash TEXT NOT NULL
+      hash TEXT NOT NULL,
+      user_agent TEXT,
+      event_result TEXT,
+      signature TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS categories (
+      id TEXT PRIMARY KEY,
+      owner_id TEXT NOT NULL,
+      name TEXT NOT NULL COLLATE NOCASE,
+      created_at TEXT NOT NULL,
+      UNIQUE(owner_id, name),
+      FOREIGN KEY(owner_id) REFERENCES users(id)
     );
 
     CREATE TABLE IF NOT EXISTS settings (
@@ -120,12 +135,77 @@ function initializeDatabase() {
   `);
 
   migrateUserColumns();
+  migrateAuditColumns();
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS audit_events_no_update
+    BEFORE UPDATE ON audit_events
+    BEGIN
+      SELECT RAISE(ABORT, 'audit events are append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS audit_events_no_delete
+    BEFORE DELETE ON audit_events
+    BEGIN
+      SELECT RAISE(ABORT, 'audit events are append-only');
+    END;
+  `);
+  migrateActivePermissionUniqueness();
 
   const rows = db.prepare('SELECT COUNT(*) AS count FROM users').get();
   if (!rows || Number(rows.count) === 0) {
     db.prepare('INSERT OR IGNORE INTO settings(name, value, updated_at) VALUES(?, ?, ?)')
       .run('first_run_completed', 'false', nowIso());
   }
+}
+
+function migrateActivePermissionUniqueness() {
+  db.transaction(() => {
+    const duplicates = db.prepare(`
+      SELECT document_id, user_id, COUNT(*) AS count
+      FROM document_permissions
+      WHERE active = 1
+      GROUP BY document_id, user_id
+      HAVING COUNT(*) > 1
+    `).all();
+
+    for (const duplicate of duplicates) {
+      const activeRows = db.prepare(`
+        SELECT id FROM document_permissions
+        WHERE document_id = ? AND user_id = ? AND active = 1
+        ORDER BY created_at DESC, rowid DESC
+      `).all(duplicate.document_id, duplicate.user_id);
+      const superseded = activeRows.slice(1);
+      for (const permission of superseded) {
+        const now = nowIso();
+        db.prepare(`
+          UPDATE document_permissions SET active = 0, revoked_at = ?, updated_at = ?
+          WHERE id = ?
+        `).run(now, now, permission.id);
+        recordAuditEvent({
+          action: 'duplicate_permission_deactivated',
+          resourceType: 'document_permission',
+          resourceId: permission.id,
+          details: { documentId: duplicate.document_id, userId: duplicate.user_id, reason: 'migration' },
+          eventResult: 'success'
+        });
+      }
+    }
+
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS document_permissions_one_active
+      ON document_permissions(document_id, user_id) WHERE active = 1
+    `);
+  })();
+}
+
+function migrateAuditColumns() {
+  const columns = new Set(db.prepare('PRAGMA table_info(audit_events)').all().map((column) => column.name));
+  db.transaction(() => {
+    if (!columns.has('user_agent')) db.exec('ALTER TABLE audit_events ADD COLUMN user_agent TEXT');
+    if (!columns.has('event_result')) db.exec('ALTER TABLE audit_events ADD COLUMN event_result TEXT');
+    if (!columns.has('signature')) db.exec('ALTER TABLE audit_events ADD COLUMN signature TEXT');
+  })();
 }
 
 function getSetting(name, fallback = null) {
@@ -139,7 +219,17 @@ function setSetting(name, value) {
     .run(name, String(value), nowIso());
 }
 
-function recordAuditEvent({ actorId, actorName, action, resourceType, resourceId, details, ip }) {
+function recordAuditEvent({
+  actorId,
+  actorName,
+  action,
+  resourceType,
+  resourceId,
+  details,
+  ip,
+  userAgent = null,
+  eventResult = 'success'
+}) {
   const latestHash = db.prepare('SELECT hash FROM audit_events ORDER BY rowid DESC LIMIT 1').get();
   const prevHash = latestHash ? latestHash.hash : 'GENESIS';
   const createdAt = nowIso();
@@ -154,12 +244,18 @@ function recordAuditEvent({ actorId, actorName, action, resourceType, resourceId
     createdAt,
     prevHash
   };
+  event.userAgent = userAgent || null;
+  event.eventResult = eventResult;
   const digest = crypto.createHash('sha256').update(JSON.stringify(event)).digest('hex');
+  const signature = crypto.createHmac('sha256', auditSecret).update(digest).digest('hex');
   const id = crypto.randomUUID();
 
   db.prepare(`
-    INSERT INTO audit_events(id, actor_id, actor_name, action, resource_type, resource_id, details, ip, created_at, prev_hash, hash)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO audit_events(
+      id, actor_id, actor_name, action, resource_type, resource_id, details, ip,
+      created_at, prev_hash, hash, user_agent, event_result, signature
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     event.actorId,
@@ -171,7 +267,10 @@ function recordAuditEvent({ actorId, actorName, action, resourceType, resourceId
     event.ip,
     createdAt,
     prevHash,
-    digest
+    digest,
+    event.userAgent,
+    event.eventResult,
+    signature
   );
 
   return digest;
@@ -183,21 +282,52 @@ function verifyAuditChain() {
   let issues = [];
 
   for (const row of rows) {
-    const payload = JSON.stringify({
+    let details = null;
+    let detailsValid = true;
+    if (row.details) {
+      try {
+        details = JSON.parse(row.details);
+      } catch (_error) {
+        details = row.details;
+        detailsValid = false;
+      }
+    }
+
+    const event = {
       actorId: row.actor_id,
       actorName: row.actor_name,
       action: row.action,
       resourceType: row.resource_type,
       resourceId: row.resource_id,
-      details: row.details ? JSON.parse(row.details) : null,
+      details,
       ip: row.ip,
       createdAt: row.created_at,
       prevHash: previous
-    });
+    };
+    if (row.user_agent !== null || row.event_result !== null) {
+      event.userAgent = row.user_agent;
+      event.eventResult = row.event_result;
+    }
 
-    const digest = crypto.createHash('sha256').update(payload).digest('hex');
-    if (row.prev_hash !== previous || row.hash !== digest) {
-      issues.push({ id: row.id, expected: digest, actual: row.hash, previousHash: previous, actualPreviousHash: row.prev_hash });
+    const digest = crypto.createHash('sha256').update(JSON.stringify(event)).digest('hex');
+    const expectedSignature = row.signature
+      ? crypto.createHmac('sha256', auditSecret).update(digest).digest('hex')
+      : null;
+    const storedSignature = row.signature ? Buffer.from(row.signature, 'hex') : null;
+    const expectedSignatureBuffer = expectedSignature ? Buffer.from(expectedSignature, 'hex') : null;
+    const signatureValid = !row.signature
+      || (/^[a-f0-9]{64}$/i.test(row.signature)
+        && storedSignature.length === expectedSignatureBuffer.length
+        && crypto.timingSafeEqual(storedSignature, expectedSignatureBuffer));
+    if (!detailsValid || row.prev_hash !== previous || row.hash !== digest || !signatureValid) {
+      issues.push({
+        id: row.id,
+        expected: digest,
+        actual: row.hash,
+        previousHash: previous,
+        actualPreviousHash: row.prev_hash,
+        signatureValid
+      });
     }
     previous = row.hash;
   }
@@ -254,6 +384,30 @@ function getAllUsers() {
   return db.prepare('SELECT * FROM users ORDER BY created_at DESC').all();
 }
 
+function getCategoriesForUser(user) {
+  return db.prepare(`
+    SELECT name FROM categories WHERE owner_id = ?
+    UNION
+    SELECT DISTINCT d.category AS name
+    FROM documents d
+    WHERE d.is_deleted = 0 AND (
+      d.owner_id = ? OR EXISTS (
+        SELECT 1 FROM document_permissions dp
+        WHERE dp.document_id = d.id AND dp.user_id = ? AND dp.active = 1
+          AND (dp.expires_at IS NULL OR datetime(dp.expires_at) > datetime('now'))
+      )
+    )
+    ORDER BY name COLLATE NOCASE
+  `).all(user.id, user.id, user.id).map((row) => row.name);
+}
+
+function createCategory({ id, ownerId, name }) {
+  const createdAt = nowIso();
+  db.prepare('INSERT INTO categories(id, owner_id, name, created_at) VALUES (?, ?, ?, ?)')
+    .run(id, ownerId, name.trim(), createdAt);
+  return db.prepare('SELECT id, owner_id, name, created_at FROM categories WHERE id = ?').get(id);
+}
+
 function listAllDocuments() {
   return db.prepare(`
     SELECT id, owner_id, name, category, created_at
@@ -296,6 +450,7 @@ function getDocumentPermissions(documentId) {
     FROM document_permissions dp
     JOIN users u ON u.id = dp.user_id
     WHERE dp.document_id = ? AND dp.active = 1
+      AND (dp.expires_at IS NULL OR datetime(dp.expires_at) > datetime('now'))
     ORDER BY dp.created_at DESC
   `).all(documentId);
 }
@@ -384,7 +539,9 @@ function deleteDocument(id) {
 
 function getAuditEvents(limit = 100) {
   return db.prepare(`
-    SELECT * FROM audit_events ORDER BY rowid DESC LIMIT ?
+    SELECT id, actor_id, actor_name, action, resource_type, resource_id, details,
+      ip, user_agent, event_result, created_at, prev_hash, hash
+    FROM audit_events ORDER BY rowid DESC LIMIT ?
   `).all(limit);
 }
 
@@ -413,6 +570,8 @@ module.exports = {
   createRegisteredUser,
   updateUser,
   getAllUsers,
+  getCategoriesForUser,
+  createCategory,
   listAllDocuments,
   getDocumentById,
   listDocumentsForUser,
