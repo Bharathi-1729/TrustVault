@@ -1,6 +1,6 @@
-import { createClient } from "@supabase/supabase-js";
+import { createRepository } from "../../db/repository.mjs";
+import { privateDocuments } from "../../db/storage.mjs";
 import bcrypt from "bcryptjs";
-import { SignJWT, jwtVerify } from "jose";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import jpeg from "jpeg-js";
 import { PDFDocument } from "pdf-lib";
@@ -28,30 +28,7 @@ const ACTIVE_CONTENT_MARKERS = [
   /<\s*embed\b/i,
 ];
 const GENESIS_HASH = "0".repeat(64);
-const encoder = new TextEncoder();
 
-function configuration() {
-  const required = [
-    "SUPABASE_URL",
-    "SUPABASE_SERVICE_ROLE_KEY",
-    "TRUSTVAULT_SESSION_HASH_KEY",
-  ];
-  const missing = required.filter((key) => !process.env[key]);
-  if (missing.length) {
-    throw new Error(`Missing required Netlify environment variables: ${missing.join(", ")}`);
-  }
-  if (encoder.encode(process.env.TRUSTVAULT_SESSION_HASH_KEY).length < 32) {
-    throw new Error("TRUSTVAULT_SESSION_HASH_KEY must be at least 32 bytes.");
-  }
-  return {
-    supabase: createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_ROLE_KEY,
-      { auth: { persistSession: false, autoRefreshToken: false } },
-    ),
-    sessionKey: encoder.encode(process.env.TRUSTVAULT_SESSION_HASH_KEY),
-  };
-}
 
 function jsonResponse(status, value, headers = {}) {
   return new Response(JSON.stringify(value), {
@@ -90,48 +67,28 @@ function clearSessionCookie() {
   return `${SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`;
 }
 
-async function createSession(user, sessionKey) {
-  const csrf = randomUUID() + randomUUID();
-  const token = await new SignJWT({
-    user_id: user.id,
-    auth_version: user.auth_version,
-    csrf,
-  })
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setExpirationTime(`${SESSION_MAX_AGE}s`)
-    .sign(sessionKey);
-  return { token, csrf };
+async function createSession(user, store) {
+  const token = randomBytes(32).toString("base64url");
+  await store.from("server_sessions").insert({
+    sid_hash: hashHex(token), user_id: user.id, auth_version: user.auth_version,
+    created_at: nowUtc(), expires_at: new Date(Date.now() + SESSION_MAX_AGE * 1000).toISOString(),
+  }).throwOnError();
+  return { token, csrf: hashHex("csrf:" + token) };
 }
 
-async function currentUser(request, supabase, sessionKey) {
+async function currentUser(request, store) {
   const token = cookieValue(request, SESSION_COOKIE);
-  if (!token) return { user: null, csrf: null };
-  try {
-    const { payload } = await jwtVerify(token, sessionKey, { algorithms: ["HS256"] });
-    if (typeof payload.user_id !== "string" || typeof payload.csrf !== "string") {
-      return { user: null, csrf: null };
-    }
-    const { data, error } = await supabase
-      .from("users")
-      .select("id,email,name,role,status,auth_version,created_at")
-      .eq("id", payload.user_id)
-      .maybeSingle();
-    if (error) throw error;
-    if (
-      !data ||
-      data.status !== "active" ||
-      data.auth_version !== payload.auth_version
-    ) {
-      return { user: null, csrf: null };
-    }
-    return { user: data, csrf: payload.csrf };
-  } catch (error) {
-    if (error?.code?.startsWith("ERR_JWT") || error?.code?.startsWith("ERR_JWS")) {
-      return { user: null, csrf: null };
-    }
-    throw error;
+  if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token)) return { user: null, csrf: null };
+  const session = await store.from("server_sessions").select("user_id,auth_version,expires_at")
+    .eq("sid_hash", hashHex(token)).maybeSingle().throwOnError();
+  if (!session.data || session.data.expires_at <= new Date().toISOString()) return { user: null, csrf: null };
+  const { data } = await store.from("users")
+    .select("id,email,name,role,status,auth_version,created_at")
+    .eq("id", session.data.user_id).maybeSingle().throwOnError();
+  if (!data || data.status !== "active" || data.auth_version !== session.data.auth_version) {
+    return { user: null, csrf: null };
   }
+  return { user: data, csrf: hashHex("csrf:" + token) };
 }
 
 async function requestBody(request) {
@@ -280,23 +237,17 @@ class HttpError extends Error {
   }
 }
 
-async function appendAudit(supabase, event) {
+async function appendAudit(store, event) {
   const details = event.details || {};
   validateAuditDetails(details);
-  const result = await supabase.rpc("trustvault_append_audit", {
-    p_id: newId(),
-    p_timestamp: event.timestamp || nowUtc(),
-    p_user_id: event.user_id || null,
-    p_username: event.username || null,
-    p_action: event.action,
-    p_document_id: event.document_id || null,
-    p_ip_address: event.ip_address || null,
-    p_status: event.status || "success",
-    p_details: details,
-    p_user_agent: event.user_agent || null,
+  return store.appendAudit({
+    id: newId(), timestamp: event.timestamp || nowUtc(),
+    user_id: event.user_id || null, username: event.username || null,
+    action: event.action, document_id: event.document_id || null,
+    ip_address: event.ip_address?.slice(0, 64) || null,
+    status: event.status || "success", details,
+    user_agent: event.user_agent || null,
   });
-  if (result.error) throw result.error;
-  return result.data;
 }
 
 function validateAuditDetails(value, key = "") {
@@ -331,8 +282,8 @@ function validateAuditDetails(value, key = "") {
   }
 }
 
-async function authorizeDocument(supabase, user, documentId, permission, ownerOnly = false) {
-  const result = await supabase
+async function authorizeDocument(store, user, documentId, permission, ownerOnly = false) {
+  const result = await store
     .from("documents")
     .select("*")
     .eq("id", documentId)
@@ -343,7 +294,7 @@ async function authorizeDocument(supabase, user, documentId, permission, ownerOn
   if (!document) throw new HttpError(404, "The requested resource is not available.");
   if (document.owner_id === user.id) return document;
   if (ownerOnly) throw new HttpError(404, "The requested resource is not available.");
-  const grantResult = await supabase
+  const grantResult = await store
     .from("document_permissions")
     .select("permission,expires_at")
     .eq("document_id", documentId)
@@ -375,16 +326,16 @@ async function requireAdmin(user) {
   }
 }
 
-async function handleApi(request, url, context) {
-  const { supabase, sessionKey } = configuration();
-  const { user, csrf } = await currentUser(request, supabase, sessionKey);
+async function handleApi(request, url, context, services) {
+  const store = services.repository();
+  const { user, csrf } = await currentUser(request, store);
   const method = request.method.toUpperCase();
   const pathname = url.pathname;
-  const ip = request.headers.get("x-nf-client-connection-ip") || "unknown";
+  const ip = context.ip || "unknown";
   const userAgent = (request.headers.get("user-agent") || "").slice(0, 512);
 
   if (pathname === "/healthz" && method === "GET") {
-    const { error } = await supabase.from("users").select("id").limit(1);
+    const { error } = await store.from("users").select("id").limit(1);
     if (error) throw error;
     return jsonResponse(200, { status: "ok" });
   }
@@ -405,14 +356,14 @@ async function handleApi(request, url, context) {
       !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
       email.length > 254 ||
       password.length < 12 ||
-      password.length > 1024 ||
+      Buffer.byteLength(password, "utf8") > 72 ||
       inviteToken.length < 32 ||
       inviteToken.length > 256
     ) {
       throw new HttpError(400, "Registration details are invalid.");
     }
     const tokenHash = hashHex(inviteToken);
-    const inviteResult = await supabase
+    const inviteResult = await store
       .from("registration_invites")
       .select("id,role,expires_at,consumed_at")
       .eq("token_hash", tokenHash)
@@ -429,44 +380,29 @@ async function handleApi(request, url, context) {
     }
     const passwordHash = await bcrypt.hash(password, 12);
     const createdAt = nowUtc();
-    const created = await supabase.from("users").insert({
-      id: newId(),
-      email,
-      name,
-      password_hash: passwordHash,
-      role: invite.role,
-      status: "active",
-      auth_version: 1,
-      created_at: createdAt,
-      updated_at: createdAt,
-    }).select("id").single();
-    if (created.error) {
-      if (created.error.code === "23505") {
+    try {
+      await store.transaction(async transaction => {
+        const consumed = await transaction.from("registration_invites")
+          .update({ consumed_at: createdAt }).eq("id", invite.id)
+          .is("consumed_at", null).gt("expires_at", createdAt)
+          .select("id").maybeSingle().throwOnError();
+        if (!consumed.data) throw new HttpError(409, "The invitation was already used.");
+        const id = newId();
+        await transaction.from("users").insert({
+          id, email, name, password_hash: passwordHash, role: invite.role,
+          status: "active", auth_version: 1, created_at: createdAt, updated_at: createdAt,
+        }).throwOnError();
+        await appendAudit(transaction, {
+          action: "user_registered", user_id: id, username: email,
+          ip_address: ip, user_agent: userAgent, details: { role: invite.role },
+        });
+      });
+    } catch (error) {
+      if ((error?.cause?.code || error?.code) === "23505") {
         throw new HttpError(409, "An account with that email already exists.");
       }
-      throw created.error;
+      throw error;
     }
-    const consumed = await supabase
-      .from("registration_invites")
-      .update({ consumed_at: createdAt })
-      .eq("id", invite.id)
-      .is("consumed_at", null)
-      .gt("expires_at", createdAt)
-      .select("id")
-      .maybeSingle();
-    if (consumed.error) throw consumed.error;
-    if (!consumed.data) {
-      await supabase.from("users").delete().eq("id", created.data.id);
-      throw new HttpError(409, "The invitation was already used.");
-    }
-    await appendAudit(supabase, {
-      action: "user_registered",
-      user_id: created.data.id,
-      username: email,
-      ip_address: ip,
-      user_agent: userAgent,
-      details: { role: invite.role },
-    });
     return jsonResponse(201, { message: "Account created. You can now sign in." });
   }
 
@@ -474,20 +410,20 @@ async function handleApi(request, url, context) {
     const data = await requestBody(request);
     const email = typeof data.email === "string" ? data.email.trim().toLowerCase() : "";
     const password = typeof data.password === "string" ? data.password : "";
-    if (email.length > 254 || password.length > 1024) {
+    if (email.length > 254 || Buffer.byteLength(password, "utf8") > 72) {
       throw new HttpError(400, "Invalid email or password.");
     }
     const identifierHash = hashHex(email);
     const windowStart = new Date(Date.now() - 15 * 60 * 1000).toISOString();
     const [identifierAttempts, ipAttempts] = await Promise.all([
-      supabase
+      store
       .from("login_attempts")
       .select("id")
       .eq("username_key", identifierHash)
       .eq("outcome", "failed")
       .gt("attempted_at", windowStart)
       .limit(100),
-      supabase
+      store
         .from("login_attempts")
         .select("id")
         .eq("source_ip", ip.slice(0, 64))
@@ -501,7 +437,7 @@ async function handleApi(request, url, context) {
       ...identifierAttempts.data.map((attempt) => attempt.id),
       ...ipAttempts.data.map((attempt) => attempt.id),
     ]).size;
-    const userResult = await supabase
+    const userResult = await store
       .from("users")
       .select("id,email,name,role,status,auth_version,created_at,password_hash")
       .eq("email", email)
@@ -515,7 +451,7 @@ async function handleApi(request, url, context) {
       failedAttempts < 5 &&
       candidate?.status === "active" &&
       matches;
-    await supabase.from("login_attempts").insert({
+    await store.from("login_attempts").insert({
       id: newId(),
       username_key: identifierHash,
       source_ip: ip.slice(0, 64),
@@ -523,7 +459,7 @@ async function handleApi(request, url, context) {
       outcome: accepted ? "success" : failedAttempts >= 5 ? "blocked" : "failed",
     }).throwOnError();
     if (!accepted) {
-      await appendAudit(supabase, {
+      await appendAudit(store, {
         action: "login_failed",
         user_id: candidate?.id,
         username: email || null,
@@ -534,8 +470,8 @@ async function handleApi(request, url, context) {
       });
       throw new HttpError(401, "Invalid email or password.");
     }
-    const session = await createSession(candidate, sessionKey);
-    await appendAudit(supabase, {
+    const session = await createSession(candidate, store);
+    await appendAudit(store, {
       action: "login_succeeded",
       user_id: candidate.id,
       username: candidate.email,
@@ -557,7 +493,7 @@ async function handleApi(request, url, context) {
   if (pathname === "/api/auth/logout" && method === "POST") {
     assertCsrf(request, csrf);
     if (user) {
-      await appendAudit(supabase, {
+      await appendAudit(store, {
         action: "logout",
         user_id: user.id,
         username: user.email,
@@ -565,6 +501,8 @@ async function handleApi(request, url, context) {
         user_agent: userAgent,
       });
     }
+    const logoutCookie = cookieValue(request, SESSION_COOKIE);
+    if (logoutCookie) await store.from("server_sessions").delete().eq("sid_hash", hashHex(logoutCookie)).throwOnError();
     return jsonResponse(200, { message: "Signed out." }, { "Set-Cookie": clearSessionCookie() });
   }
 
@@ -572,14 +510,14 @@ async function handleApi(request, url, context) {
     await requireUser(user);
     const query = (url.searchParams.get("q") || "").trim().slice(0, 254).toLowerCase();
     const { page, pageSize } = pagination(url);
-    const owned = await supabase
+    const owned = await store
       .from("documents")
       .select("id,owner_id,name,description,category,mime_type,size_bytes,created_at,updated_at", { count: "exact" })
       .eq("owner_id", user.id)
       .is("deleted_at", null)
       .order("created_at", { ascending: false });
     if (owned.error) throw owned.error;
-    const grants = await supabase
+    const grants = await store
       .from("document_permissions")
       .select("document_id,permission,expires_at")
       .eq("user_id", user.id)
@@ -590,7 +528,7 @@ async function handleApi(request, url, context) {
       .map((grant) => grant.document_id);
     let shared = { data: [], error: null };
     if (ids.length) {
-      shared = await supabase
+      shared = await store
         .from("documents")
         .select("id,owner_id,name,description,category,mime_type,size_bytes,created_at,updated_at")
         .in("id", ids)
@@ -627,6 +565,7 @@ async function handleApi(request, url, context) {
       throw new HttpError(403, "Document owner access is required.");
     }
     const data = await requestBody(request);
+    if (!(data instanceof FormData)) throw new HttpError(415, "A multipart file upload is required.");
     const file = data.get("file");
     if (!(file instanceof File) || file.size < 1 || file.size > MAX_FILE_BYTES) {
       throw new HttpError(400, "Choose a file up to 4 MB.");
@@ -650,14 +589,11 @@ async function handleApi(request, url, context) {
     const documentId = newId();
     const storageKey = `${newId()}.${extension}`;
     const digest = hashHex(content);
-    const store = supabase.storage.from("trustvault-private");
-    const upload = await store.upload(storageKey, content, {
-      contentType: "application/octet-stream",
-      upsert: false,
-    });
+    const blobStore = services.documentStore(context);
+    const upload = await blobStore.upload(storageKey, content);
     if (upload.error) throw upload.error;
     const createdAt = nowUtc();
-    const created = await supabase.from("documents").insert({
+    const created = await store.from("documents").insert({
       id: documentId,
       owner_id: user.id,
       storage_key: storageKey,
@@ -672,10 +608,10 @@ async function handleApi(request, url, context) {
       updated_at: createdAt,
     }).select("id,name,description,category,mime_type,size_bytes,created_at,updated_at").single();
     if (created.error) {
-      await store.remove([storageKey]);
+      await blobStore.remove([storageKey]);
       throw created.error;
     }
-    await appendAudit(supabase, {
+    await appendAudit(store, {
       action: "document_uploaded",
       user_id: user.id,
       username: user.email,
@@ -692,11 +628,11 @@ async function handleApi(request, url, context) {
     await requireUser(user);
     const [, documentId, action, grantId] = documentRoute;
     if (!action && method === "GET" || action === "download" && method === "GET") {
-      const doc = await authorizeDocument(supabase, user, documentId, "read");
-      const download = await supabase.storage.from("trustvault-private").download(doc.storage_key);
+      const doc = await authorizeDocument(store, user, documentId, "read");
+      const download = await services.documentStore(context).download(doc.storage_key);
       if (download.error) throw new HttpError(404, "The requested resource is not available.");
       const bytes = await download.data.arrayBuffer();
-      await appendAudit(supabase, {
+      await appendAudit(store, {
         action: action ? "document_downloaded" : "document_viewed",
         user_id: user.id,
         username: user.email,
@@ -705,7 +641,7 @@ async function handleApi(request, url, context) {
         user_agent: userAgent,
         details: { size_bytes: bytes.byteLength },
       });
-      const filename = doc.name.replace(/[\r\n"]/g, "_");
+      const filename = doc.name.replace(/[^\x20-\x7e]|["\\]/g, "_");
       return new Response(bytes, {
         status: 200,
         headers: {
@@ -719,7 +655,7 @@ async function handleApi(request, url, context) {
     }
     if (!action && method === "PATCH") {
       assertCsrf(request, csrf);
-      const doc = await authorizeDocument(supabase, user, documentId, "edit");
+      const doc = await authorizeDocument(store, user, documentId, "edit");
       const body = await requestBody(request);
       const allowed = new Set(["name", "description", "category"]);
       if (!Object.keys(body).length || Object.keys(body).some((key) => !allowed.has(key))) {
@@ -744,10 +680,10 @@ async function handleApi(request, url, context) {
         }
         changes.category = body.category.trim();
       }
-      const updated = await supabase.from("documents").update(changes).eq("id", doc.id)
+      const updated = await store.from("documents").update(changes).eq("id", doc.id)
         .select("id,name,description,category,mime_type,size_bytes,created_at,updated_at").single();
       if (updated.error) throw updated.error;
-      await appendAudit(supabase, {
+      await appendAudit(store, {
         action: "document_metadata_edited",
         user_id: user.id,
         username: user.email,
@@ -760,9 +696,9 @@ async function handleApi(request, url, context) {
     }
     if (!action && method === "DELETE") {
       assertCsrf(request, csrf);
-      const doc = await authorizeDocument(supabase, user, documentId, "edit");
+      const doc = await authorizeDocument(store, user, documentId, "edit");
       const deletedAt = nowUtc();
-      const deleted = await supabase.from("documents")
+      const deleted = await store.from("documents")
         .update({ deleted_at: deletedAt, updated_at: deletedAt })
         .eq("id", doc.id)
         .is("deleted_at", null)
@@ -770,7 +706,7 @@ async function handleApi(request, url, context) {
         .maybeSingle();
       if (deleted.error) throw deleted.error;
       if (!deleted.data) throw new HttpError(404, "The requested resource is not available.");
-      await appendAudit(supabase, {
+      await appendAudit(store, {
         action: "document_deleted",
         user_id: user.id,
         username: user.email,
@@ -778,18 +714,18 @@ async function handleApi(request, url, context) {
         ip_address: ip,
         user_agent: userAgent,
       });
-      const removed = await supabase.storage.from("trustvault-private").remove([doc.storage_key]);
+      const removed = await services.documentStore(context).remove([doc.storage_key]);
       if (removed.error) {
-        console.error("Deleted document object cleanup failed", removed.error);
+        console.error("Deleted document object cleanup failed");
         throw new HttpError(500, "Document access was revoked, but private storage cleanup failed.");
       }
       return jsonResponse(200, { message: "Document deleted." });
     }
     if (action === "permissions" && !grantId && method === "GET") {
-      const doc = await authorizeDocument(supabase, user, documentId, "edit", true);
-      const result = await supabase
+      const doc = await authorizeDocument(store, user, documentId, "edit", true);
+      const result = await store
         .from("document_permissions")
-        .select("id,user_id,permission,granted_at,expires_at,revoked_at,users!document_permissions_user_id_fkey(email,name)")
+        .select("id,user_id,permission,granted_at,expires_at,revoked_at,users(email,name)")
         .eq("document_id", doc.id)
         .order("granted_at", { ascending: false });
       if (result.error) throw result.error;
@@ -797,7 +733,7 @@ async function handleApi(request, url, context) {
     }
     if (action === "permissions" && !grantId && method === "POST") {
       assertCsrf(request, csrf);
-      const doc = await authorizeDocument(supabase, user, documentId, "edit", true);
+      const doc = await authorizeDocument(store, user, documentId, "edit", true);
       const body = await requestBody(request);
       const recipientEmail = typeof body.recipient_email === "string"
         ? body.recipient_email.trim().toLowerCase()
@@ -806,7 +742,7 @@ async function handleApi(request, url, context) {
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail) || !PERMISSIONS.has(permission)) {
         throw new HttpError(400, "Permission details are invalid.");
       }
-      const recipient = await supabase.from("users").select("id,status,email,role")
+      const recipient = await store.from("users").select("id,status,email,role")
         .eq("email", recipientEmail).maybeSingle();
       if (recipient.error) throw recipient.error;
       if (
@@ -817,7 +753,7 @@ async function handleApi(request, url, context) {
       ) {
         throw new HttpError(400, "The selected account cannot receive access.");
       }
-      const prior = await supabase.from("document_permissions").select("id,expires_at")
+      const prior = await store.from("document_permissions").select("id,expires_at")
         .eq("document_id", doc.id)
         .eq("user_id", recipient.data.id)
         .is("revoked_at", null)
@@ -828,7 +764,7 @@ async function handleApi(request, url, context) {
           throw new HttpError(409, "An active permission already exists for this account.");
         }
         const expiredAt = nowUtc();
-        const revoked = await supabase.from("document_permissions")
+        const revoked = await store.from("document_permissions")
           .update({ revoked_at: expiredAt })
           .eq("id", prior.data.id)
           .is("revoked_at", null)
@@ -836,7 +772,7 @@ async function handleApi(request, url, context) {
           .maybeSingle();
         if (revoked.error) throw revoked.error;
         if (revoked.data) {
-          await appendAudit(supabase, {
+          await appendAudit(store, {
             action: "document_permission_expired",
             user_id: user.id,
             username: user.email,
@@ -848,7 +784,7 @@ async function handleApi(request, url, context) {
         }
       }
       const createdAt = nowUtc();
-      const grant = await supabase.from("document_permissions").insert({
+      const grant = await store.from("document_permissions").insert({
         id: newId(),
         document_id: doc.id,
         user_id: recipient.data.id,
@@ -862,7 +798,7 @@ async function handleApi(request, url, context) {
         }
         throw grant.error;
       }
-      await appendAudit(supabase, {
+      await appendAudit(store, {
         action: "document_permission_granted",
         user_id: user.id,
         username: user.email,
@@ -875,9 +811,9 @@ async function handleApi(request, url, context) {
     }
     if (action === "permissions" && grantId && method === "DELETE") {
       assertCsrf(request, csrf);
-      const doc = await authorizeDocument(supabase, user, documentId, "edit", true);
+      const doc = await authorizeDocument(store, user, documentId, "edit", true);
       const revokedAt = nowUtc();
-      const revoked = await supabase.from("document_permissions")
+      const revoked = await store.from("document_permissions")
         .update({ revoked_at: revokedAt })
         .eq("id", grantId)
         .eq("document_id", doc.id)
@@ -886,7 +822,7 @@ async function handleApi(request, url, context) {
         .maybeSingle();
       if (revoked.error) throw revoked.error;
       if (!revoked.data) throw new HttpError(404, "Permission not found.");
-      await appendAudit(supabase, {
+      await appendAudit(store, {
         action: "document_permission_revoked",
         user_id: user.id,
         username: user.email,
@@ -922,7 +858,7 @@ async function handleApi(request, url, context) {
       const expiresAt = new Date(Date.now() + lifetimeHours * 60 * 60 * 1000)
         .toISOString()
         .replace(/\.\d{3}Z$/, "Z");
-      const invite = await supabase.from("registration_invites").insert({
+      const invite = await store.from("registration_invites").insert({
         id: newId(),
         token_hash: hashHex(token),
         role,
@@ -931,7 +867,7 @@ async function handleApi(request, url, context) {
         created_by: user.id,
       }).select("id").single();
       if (invite.error) throw invite.error;
-      await appendAudit(supabase, {
+      await appendAudit(store, {
         action: "registration_invite_created",
         user_id: user.id,
         username: user.email,
@@ -943,7 +879,7 @@ async function handleApi(request, url, context) {
     }
     if (pathname === "/api/admin/dashboard" && method === "GET") {
       const count = (table, configure = (query) => query) =>
-        configure(supabase.from(table).select("*", { count: "exact", head: true }));
+        configure(store.from(table).select("*", { count: "exact", head: true }));
       const queries = await Promise.all([
         count("users"),
         count("users", (query) => query.eq("role", "administrator")),
@@ -954,12 +890,12 @@ async function handleApi(request, url, context) {
         count("documents"),
         count("document_permissions", (query) =>
           query.is("revoked_at", null).or(`expires_at.is.null,expires_at.gt.${nowUtc()}`)),
-        supabase.from("users").select("id,name,email,role,status,created_at")
+        store.from("users").select("id,name,email,role,status,created_at")
           .order("created_at", { ascending: false }).limit(8),
-        supabase.from("documents")
-          .select("id,name,mime_type,created_at,owner_id,users!documents_owner_id_fkey(name,email)")
+        store.from("documents")
+          .select("id,name,mime_type,created_at,owner_id,users(name,email)")
           .order("created_at", { ascending: false }).limit(8),
-        supabase.from("audit_logs")
+        store.from("audit_logs")
           .select("id,timestamp,username,action,status,ip_address,document_id")
           .in("status", ["denied", "failure"])
           .order("sequence", { ascending: false }).limit(10),
@@ -978,7 +914,7 @@ async function handleApi(request, url, context) {
     }
     if (pathname === "/api/admin/users" && method === "GET") {
       const { page, pageSize, from, to } = pagination(url);
-      let query = supabase.from("users")
+      let query = store.from("users")
         .select("id,name,email,role,status,created_at", { count: "exact" })
         .order("created_at", { ascending: false })
         .range(from, to);
@@ -1000,11 +936,11 @@ async function handleApi(request, url, context) {
       if (search) {
         const pattern = `%${search.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
         const [names, emails] = await Promise.all([
-          supabase.from("users")
+          store.from("users")
             .select("id,name,email,role,status,created_at")
             .ilike("name", pattern)
             .order("created_at", { ascending: false }).limit(1000),
-          supabase.from("users")
+          store.from("users")
             .select("id,name,email,role,status,created_at")
             .ilike("email", pattern)
             .order("created_at", { ascending: false }).limit(1000),
@@ -1020,9 +956,9 @@ async function handleApi(request, url, context) {
       }
       const items = await Promise.all(users.map(async (account) => {
         const [uploads, shares] = await Promise.all([
-          supabase.from("documents").select("id", { count: "exact", head: true })
+          store.from("documents").select("id", { count: "exact", head: true })
             .eq("owner_id", account.id),
-          supabase.from("document_permissions").select("id", { count: "exact", head: true })
+          store.from("document_permissions").select("id", { count: "exact", head: true })
             .eq("granted_by", account.id),
         ]);
         if (uploads.error) throw uploads.error;
@@ -1048,12 +984,8 @@ async function handleApi(request, url, context) {
         if (targetId === user.id) {
           throw new HttpError(400, field === "role" ? "You cannot change your own role." : "You cannot change your own status.");
         }
-        const result = await supabase.rpc("trustvault_admin_update_user", {
-          p_actor_id: user.id,
-          p_target_id: targetId,
-          p_field: field,
-          p_value: value,
-          p_timestamp: nowUtc(),
+        const result = await store.adminUpdate({
+          actorId: user.id, targetId, field, value, timestamp: nowUtc(),
         });
         if (result.error) {
           if (result.error.code === "P0002") throw new HttpError(404, "User not found.");
@@ -1061,16 +993,20 @@ async function handleApi(request, url, context) {
           if (result.error.code === "42501") throw new HttpError(403, "Administrator access is required.");
           throw result.error;
         }
+        await appendAudit(store, {
+          action: "user_" + field + "_updated", user_id: user.id, username: user.email,
+          ip_address: ip, user_agent: userAgent, details: { target_id: targetId, field, value },
+        });
         return jsonResponse(200, { message: `${field === "role" ? "Role" : "Account status"} updated.`, ...result.data });
       }
-      const target = await supabase.from("users")
+      const target = await store.from("users")
         .select("id,name,email,role,status,created_at,updated_at")
         .eq("id", targetId).maybeSingle();
       if (target.error) throw target.error;
       if (!target.data) throw new HttpError(404, "User not found.");
       if (action === "activity" && method === "GET") {
         const { page, pageSize, from, to } = pagination(url);
-        const result = await supabase.from("audit_logs")
+        const result = await store.from("audit_logs")
           .select("id,timestamp,username,action,document_id,status,details,ip_address", { count: "exact" })
           .eq("user_id", targetId)
           .order("sequence", { ascending: false }).range(from, to);
@@ -1079,7 +1015,7 @@ async function handleApi(request, url, context) {
       }
       if (action === "documents" && method === "GET") {
         const { page, pageSize, from, to } = pagination(url);
-        const result = await supabase.from("documents")
+        const result = await store.from("documents")
           .select("id,name,category,mime_type,size_bytes,created_at,updated_at,deleted_at", { count: "exact" })
           .eq("owner_id", targetId).order("created_at", { ascending: false }).range(from, to);
         if (result.error) throw result.error;
@@ -1089,15 +1025,15 @@ async function handleApi(request, url, context) {
     }
     if (pathname === "/api/admin/documents" && method === "GET") {
       const { page, pageSize, from, to } = pagination(url);
-      const result = await supabase.from("documents")
-        .select("id,name,category,mime_type,size_bytes,scan_status,created_at,updated_at,deleted_at,owner_id,users!documents_owner_id_fkey(name,email)", { count: "exact" })
+      const result = await store.from("documents")
+        .select("id,name,category,mime_type,size_bytes,scan_status,created_at,updated_at,deleted_at,owner_id,users(name,email)", { count: "exact" })
         .order("created_at", { ascending: false }).range(from, to);
       if (result.error) throw result.error;
       return jsonResponse(200, paginated(result.data, result.count || 0, page, pageSize));
     }
     if (["/api/admin/activity", "/api/admin/audit-logs"].includes(pathname) && method === "GET") {
       const { page, pageSize, from, to } = pagination(url);
-      let query = supabase.from("audit_logs")
+      let query = store.from("audit_logs")
         .select("id,sequence,timestamp,user_id,username,action,document_id,ip_address,status,details", { count: "exact" })
         .order("sequence", { ascending: false }).range(from, to);
       const status = url.searchParams.get("status");
@@ -1120,7 +1056,7 @@ async function handleApi(request, url, context) {
       ];
       const reports = {};
       for (const [key, table, column] of tables) {
-        const result = await supabase.from(table).select(column).limit(5000);
+        const result = await store.from(table).select(column).limit(5000);
         if (result.error) throw result.error;
         const counts = new Map();
         for (const row of result.data) counts.set(row[column], (counts.get(row[column]) || 0) + 1);
@@ -1154,32 +1090,46 @@ function pageResponse(pathname) {
   );
 }
 
-export default async (request, context) => {
-  const url = new URL(request.url);
-  try {
-    if (url.pathname.startsWith("/api/") || url.pathname === "/healthz") {
-      return await handleApi(request, url, context);
+export function createHandler(services = { repository: createRepository, documentStore: privateDocuments }) {
+  return async (request, context = {}) => {
+    const url = new URL(request.url);
+    try {
+      if (url.pathname.startsWith("/api/") || url.pathname === "/healthz") {
+        if (Number(request.headers.get("content-length") || 0) > 5 * 1024 * 1024) {
+          throw new HttpError(413, "The request is too large.");
+        }
+        if (!["GET", "HEAD", "OPTIONS"].includes(request.method)) {
+          const origin = request.headers.get("origin");
+          if ((origin && origin !== url.origin) || request.headers.get("sec-fetch-site") === "cross-site") {
+            throw new HttpError(403, "The request could not be verified.");
+          }
+        }
+        return await handleApi(request, url, context, services);
+      }
+      if (url.pathname === "/") {
+        return Response.redirect(new URL("/login", url), 302);
+      }
+      if (
+        ["/login", "/register", "/documents", "/search", "/upload", "/profile", "/admin"].includes(url.pathname) ||
+        /^\/documents\/[a-f0-9]{32}\/sharing$/.test(url.pathname)
+      ) {
+        return pageResponse(url.pathname);
+      }
+      return jsonResponse(404, { error: "Not found." });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return jsonResponse(error.status, { error: error.message }, error.status === 401
+          ? { "Set-Cookie": clearSessionCookie() }
+          : {});
+      }
+      console.error("TrustVault request failed", { code: error?.cause?.code || error?.code || "INTERNAL_ERROR" });
+      return jsonResponse(500, { error: "The request could not be completed." });
     }
-    if (url.pathname === "/") {
-      return Response.redirect(new URL("/login", url), 302);
-    }
-    if (
-      ["/login", "/register", "/documents", "/search", "/upload", "/profile", "/admin"].includes(url.pathname) ||
-      /^\/documents\/[a-f0-9]{32}\/sharing$/.test(url.pathname)
-    ) {
-      return pageResponse(url.pathname);
-    }
-    return jsonResponse(404, { error: "Not found." });
-  } catch (error) {
-    if (error instanceof HttpError) {
-      return jsonResponse(error.status, { error: error.message }, error.status === 401
-        ? { "Set-Cookie": clearSessionCookie() }
-        : {});
-    }
-    console.error("TrustVault function failure", error);
-    return jsonResponse(500, { error: "The request could not be completed." });
-  }
-};
+  };
+
+}
+
+export default createHandler();
 
 export const config = {
   path: ["/*"],

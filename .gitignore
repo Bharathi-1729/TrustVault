@@ -12,3 +12,7 @@ backups/*
 *.sqlite3
 *.sqlite3-*
 *.sqlite3.bak
+
+node_modules/
+
+.netlify/
