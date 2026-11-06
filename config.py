@@ -11,9 +11,16 @@ class Config:
 
     APP_ENV = os.environ.get("TRUSTVAULT_ENV", "development").strip().lower()
     DATA_DIR = Path(os.environ.get("TRUSTVAULT_DATA_DIR", PROJECT_ROOT / "instance"))
-    DATABASE_PATH = Path(
+    DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+    DATABASE_PATH = DATABASE_URL or Path(
         os.environ.get("TRUSTVAULT_DATABASE_PATH", DATA_DIR / "trustvault.sqlite3")
     )
+    OBJECT_STORAGE_BUCKET = os.environ.get("OBJECT_STORAGE_BUCKET", "").strip()
+    OBJECT_STORAGE_ENDPOINT = os.environ.get("OBJECT_STORAGE_ENDPOINT", "").strip()
+    OBJECT_STORAGE_ACCESS_KEY_ID = os.environ.get("OBJECT_STORAGE_ACCESS_KEY_ID", "")
+    OBJECT_STORAGE_SECRET_ACCESS_KEY = os.environ.get("OBJECT_STORAGE_SECRET_ACCESS_KEY", "")
+    OBJECT_STORAGE_REGION = os.environ.get("OBJECT_STORAGE_REGION", "auto")
+    VERCEL = os.environ.get("VERCEL") == "1"
     UPLOAD_FOLDER = Path(
         os.environ.get("TRUSTVAULT_UPLOAD_DIR", DATA_DIR / "uploads")
     )
@@ -53,6 +60,8 @@ class Config:
 
 def validate_production_config(config):
     """Fail closed when required deployment boundaries are not configured."""
+    if config.get("VERCEL") and config["APP_ENV"] != "production":
+        raise RuntimeError("TRUSTVAULT_ENV=production is required on Vercel.")
     if config["APP_ENV"] != "production":
         return
     if config["DEBUG"]:
@@ -69,21 +78,44 @@ def validate_production_config(config):
             "TRUSTVAULT_SESSION_HASH_KEY must contain at least 32 bytes in production."
         )
 
+    if config.get("VERCEL"):
+        if not str(config.get("DATABASE_URL", "")).startswith(
+            ("postgres://", "postgresql://")
+        ):
+            raise RuntimeError("DATABASE_URL must point to a PostgreSQL database on Vercel.")
+        if not all(
+            config.get(key)
+            for key in (
+                "OBJECT_STORAGE_BUCKET",
+                "OBJECT_STORAGE_ENDPOINT",
+                "OBJECT_STORAGE_ACCESS_KEY_ID",
+                "OBJECT_STORAGE_SECRET_ACCESS_KEY",
+            )
+        ):
+            raise RuntimeError(
+                "Private object-storage settings are required when deploying on Vercel."
+            )
+        return
+
     data_dir = Path(config["DATA_DIR"]).resolve()
-    database_path = Path(config["DATABASE_PATH"]).resolve()
+    database_path = (
+        Path(config["DATABASE_PATH"]).resolve()
+        if not config.get("DATABASE_URL")
+        else None
+    )
     upload_path = Path(config["UPLOAD_FOLDER"]).resolve()
     backup_path = Path(config["BACKUP_DIR"]).resolve()
     if (
-        not database_path.is_relative_to(data_dir)
+        (database_path is not None and not database_path.is_relative_to(data_dir))
         or not upload_path.is_relative_to(data_dir)
         or not backup_path.is_relative_to(data_dir)
     ):
         raise RuntimeError(
-            "Production database, uploads, and backups must be under TRUSTVAULT_DATA_DIR."
+            "Production database, uploads, and backups must be under the configured application data directory."
         )
     if (
-        database_path == upload_path
-        or database_path.is_relative_to(upload_path)
+        (database_path is not None and database_path == upload_path)
+        or (database_path is not None and database_path.is_relative_to(upload_path))
         or backup_path == upload_path
         or backup_path.is_relative_to(upload_path)
     ):
@@ -92,11 +124,23 @@ def validate_production_config(config):
 
 def ensure_private_directories(config):
     """Create the database and upload directories with restrictive defaults."""
-    database_path = Path(config["DATABASE_PATH"])
+    database_path = None
+    if not config.get("DATABASE_URL"):
+        database_path = Path(config["DATABASE_PATH"])
+    if config.get("OBJECT_STORAGE_BUCKET"):
+        if database_path is None:
+            return
+        database_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if database_path.exists() and database_path.is_symlink():
+            raise RuntimeError("Database file must not be a symbolic link.")
+        if os.name == "posix":
+            os.chmod(database_path.parent.resolve(strict=True), 0o700)
+        return
     upload_path = Path(config["UPLOAD_FOLDER"])
-    database_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if database_path is not None:
+        database_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     upload_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if database_path.exists() and database_path.is_symlink():
+    if database_path is not None and database_path.exists() and database_path.is_symlink():
         raise RuntimeError("Database file must not be a symbolic link.")
     if upload_path.is_symlink() or not upload_path.is_dir():
         raise RuntimeError("Private upload directory must be a real directory, not a symlink.")
@@ -105,5 +149,6 @@ def ensure_private_directories(config):
     if resolved_upload_path == public_root or public_root in resolved_upload_path.parents:
         raise RuntimeError("Private uploads must be stored outside the public web root.")
     if os.name == "posix":
-        os.chmod(database_path.parent.resolve(strict=True), 0o700)
+        if database_path is not None:
+            os.chmod(database_path.parent.resolve(strict=True), 0o700)
         os.chmod(resolved_upload_path, 0o700)
