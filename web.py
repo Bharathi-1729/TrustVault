@@ -282,7 +282,7 @@ def admin_dashboard():
             """
             SELECT id, name, email, role, status, created_at
             FROM users
-            ORDER BY status ASC, email COLLATE NOCASE ASC
+            ORDER BY status ASC, lower(email) ASC
             """
         ).fetchall()
         documents = db.execute(
