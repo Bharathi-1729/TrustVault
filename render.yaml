@@ -12,8 +12,6 @@ services:
     envVars:
       - key: TRUSTVAULT_ENV
         value: production
-      - key: TRUSTVAULT_DATA_DIR
-        value: /tmp/trustvault
       - key: TRUSTVAULT_SESSION_HASH_KEY
         generateValue: true
       - key: TRUSTVAULT_COOKIE_SECURE
