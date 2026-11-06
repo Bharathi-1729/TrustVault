@@ -1,0 +1,3 @@
+{
+	"dbConnectionString": "postgres://postgres@localhost:63126/postgres"
+}

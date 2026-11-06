@@ -1,0 +1,24 @@
+{
+  "name": "trustvault-netlify",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "dev": "netlify dev",
+    "create-invite": "node scripts/create-invite.mjs"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.0",
+    "bcryptjs": "^3.0.2",
+    "jose": "^6.1.0",
+    "jpeg-js": "^0.4.4",
+    "pdf-lib": "^1.17.1",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "netlify-cli": "^27.16.2"
+  }
+}

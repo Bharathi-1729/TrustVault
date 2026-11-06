@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Create account - TrustVault{% endblock %}
+{% block content %}
+<section class="panel narrow">
+  <h1>Create account</h1>
+  <section class="role-summary" aria-labelledby="role-summary-heading">
+    <h2 id="role-summary-heading">TrustVault roles</h2>
+    <dl>
+      <dt>Viewer</dt>
+      <dd>Default registration role. Can access documents explicitly shared with the account.</dd>
+      <dt>Document Owner</dt>
+      <dd>Can upload and manage documents they own. Assigned through an authorized process.</dd>
+      <dt>Administrator</dt>
+      <dd>Can review registered users and audit activity. Does not automatically access private documents.</dd>
+    </dl>
+    <p class="muted">Individual user and audit activity is private and is shown only in the authenticated administrator dashboard.</p>
+  </section>
+  <form data-register-form data-csrf="{{ csrf_token }}">
+    <label for="name">Name</label>
+    <input id="name" name="name" type="text" autocomplete="name" maxlength="120" required>
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" autocomplete="email" maxlength="254" required>
+    <label for="password">Password (at least 12 characters)</label>
+    <input id="password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required>
+    <label for="password-confirm">Confirm password</label>
+    <input id="password-confirm" name="password_confirm" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required>
+    <label for="invite-token">One-time invitation token</label>
+    <input id="invite-token" name="invite_token" type="text" autocomplete="off" maxlength="128" required>
+    <button type="submit">Create account</button>
+    <p class="form-message" data-form-message role="status" aria-live="polite"></p>
+  </form>
+  <p class="muted">Already registered? <a href="{{ url_for('web.login_page') }}">Sign in</a>.</p>
+</section>
+{% endblock %}
