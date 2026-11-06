@@ -1,6 +1,5 @@
 import json
 import secrets
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -16,7 +15,7 @@ from flask.sessions import SessionInterface, SessionMixin
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from audit import append_event
-from database import connect, get_db, transaction, utc_now
+from database import connect, get_db, integrity_errors, transaction, utc_now
 from security import (
     hash_login_identifier,
     hash_registration_invite,
@@ -443,7 +442,7 @@ def register():
                 metadata={"email": email, "role": "viewer"},
                 **_audit_request_context(),
             )
-    except sqlite3.IntegrityError as exc:
+    except integrity_errors() as exc:
         if "users.email" in str(exc):
             return _json_error("An account with that email already exists.", 409)
         raise
