@@ -3,7 +3,6 @@
 import hashlib
 import os
 import re
-import sqlite3
 import stat
 import struct
 import uuid
@@ -21,7 +20,7 @@ from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 from audit import append_event
-from database import get_db, transaction, utc_now
+from database import database_errors, get_db, integrity_errors, transaction, utc_now
 from permissions import (
     PermissionDenied,
     authorize,
@@ -132,6 +131,15 @@ def _storage_directory_fd():
 
 def _write_private_file(storage_key, content):
     name = _storage_name(storage_key)
+    if current_app.config.get("OBJECT_STORAGE_BUCKET"):
+        _object_storage_call(
+            _object_storage_client().put_object,
+            Bucket=current_app.config["OBJECT_STORAGE_BUCKET"],
+            Key=name,
+            Body=content,
+            ContentType="application/octet-stream",
+        )
+        return
     with _storage_directory_fd() as (directory_fd, directory):
         if directory_fd is not None:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
@@ -186,6 +194,23 @@ def _write_private_file(storage_key, content):
 
 def _read_private_file(storage_key):
     name = _storage_name(storage_key)
+    if current_app.config.get("OBJECT_STORAGE_BUCKET"):
+        response = _object_storage_call(
+            _object_storage_client().get_object,
+            Bucket=current_app.config["OBJECT_STORAGE_BUCKET"],
+            Key=name,
+        )
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            content = response["Body"].read(MAX_FILE_SIZE + 1)
+        except (BotoCoreError, ClientError) as error:
+            raise OSError("Private object storage operation failed.") from error
+        finally:
+            response["Body"].close()
+        if len(content) > MAX_FILE_SIZE:
+            raise OSError("Stored document exceeds the configured size limit.")
+        return content
     with _storage_directory_fd() as (directory_fd, directory):
         if directory_fd is not None:
             flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
@@ -210,6 +235,13 @@ def _read_private_file(storage_key):
 
 def _unlink_private_file(storage_key):
     name = _storage_name(storage_key)
+    if current_app.config.get("OBJECT_STORAGE_BUCKET"):
+        _object_storage_call(
+            _object_storage_client().delete_object,
+            Bucket=current_app.config["OBJECT_STORAGE_BUCKET"],
+            Key=name,
+        )
+        return
     with _storage_directory_fd() as (directory_fd, directory):
         if directory_fd is not None:
             os.unlink(name, dir_fd=directory_fd)
@@ -218,6 +250,27 @@ def _unlink_private_file(storage_key):
             if path.is_symlink() or path.resolve(strict=True).parent != directory:
                 raise OSError("Private file path is unsafe.")
             path.unlink()
+
+
+def _object_storage_client():
+    import boto3
+
+    return boto3.client(
+        "s3",
+        endpoint_url=current_app.config["OBJECT_STORAGE_ENDPOINT"],
+        aws_access_key_id=current_app.config["OBJECT_STORAGE_ACCESS_KEY_ID"],
+        aws_secret_access_key=current_app.config["OBJECT_STORAGE_SECRET_ACCESS_KEY"],
+        region_name=current_app.config["OBJECT_STORAGE_REGION"],
+    )
+
+
+def _object_storage_call(operation, **parameters):
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    try:
+        return operation(**parameters)
+    except (BotoCoreError, ClientError) as error:
+        raise OSError("Private object storage operation failed.") from error
 
 
 def _validate_png(content):
@@ -709,7 +762,7 @@ def upload_document():
                 ip_address=(request.remote_addr or "unknown")[:64],
                 user_agent=request.user_agent.string[:512],
             )
-    except (OSError, sqlite3.Error, PermissionDenied) as error:
+    except (OSError, PermissionDenied) + database_errors() as error:
         if file_written:
             try:
                 _unlink_private_file(storage_key)
@@ -874,7 +927,7 @@ def edit_document_metadata(document_id):
             result = _document_metadata(row)
     except PermissionDenied:
         return jsonify({"error": "The requested resource is not available."}), 404
-    except sqlite3.Error:
+    except database_errors():
         _event("document_metadata_edit_failed", "failure", user["id"], document_id, {"reason": "database_error"})
         current_app.logger.exception("Document metadata update failed.")
         return jsonify({"error": "The document metadata could not be updated."}), 500
@@ -905,7 +958,7 @@ def delete_document(document_id):
             storage_key = document["storage_key"]
     except PermissionDenied:
         return jsonify({"error": "The requested resource is not available."}), 404
-    except sqlite3.Error:
+    except database_errors():
         _event("document_delete_failed", "failure", user["id"], document_id, {"reason": "database_error"})
         current_app.logger.exception("Document deletion failed.")
         return jsonify({"error": "The document could not be deleted."}), 500
@@ -1000,7 +1053,7 @@ def grant_document_permission(document_id):
                 """
                 SELECT id, email, role, status
                 FROM users
-                WHERE email = ? COLLATE NOCASE
+                WHERE lower(email) = lower(?)
                 """,
                 (recipient_email,),
             ).fetchone()
@@ -1102,7 +1155,7 @@ def grant_document_permission(document_id):
             )
     except PermissionDenied:
         return jsonify({"error": "The requested resource is not available."}), 404
-    except sqlite3.IntegrityError:
+    except integrity_errors():
         _event(
             "document_permission_grant_failed",
             "failure",
@@ -1111,7 +1164,7 @@ def grant_document_permission(document_id):
             {"reason": "grant_conflict"},
         )
         return jsonify({"error": "A permission grant could not be created."}), 409
-    except sqlite3.Error:
+    except database_errors():
         _event(
             "document_permission_grant_failed",
             "failure",
@@ -1184,7 +1237,7 @@ def revoke_document_permission(document_id, grant_id):
             )
     except PermissionDenied:
         return jsonify({"error": "The requested resource is not available."}), 404
-    except sqlite3.Error:
+    except database_errors():
         _event(
             "document_permission_revoke_failed",
             "failure",
