@@ -3,7 +3,7 @@ services:
     name: trustvault-python
     runtime: python
     rootDir: TrustVault
-    plan: starter
+    plan: free
     region: oregon
     numInstances: 1
     buildCommand: pip install -r requirements.txt
@@ -13,14 +13,10 @@ services:
       - key: TRUSTVAULT_ENV
         value: production
       - key: TRUSTVAULT_DATA_DIR
-        value: /var/data/trustvault
+        value: /tmp/trustvault
       - key: TRUSTVAULT_SESSION_HASH_KEY
         generateValue: true
       - key: TRUSTVAULT_COOKIE_SECURE
         value: "true"
       - key: TRUSTVAULT_SQLITE_BUSY_TIMEOUT_MS
         value: "10000"
-    disk:
-      name: trustvault-python-data
-      mountPath: /var/data
-      sizeGB: 10
