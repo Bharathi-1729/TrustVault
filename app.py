@@ -1,14 +1,13 @@
 """Flask application factory for the TrustVault foundation."""
 
-import sqlite3
-
 from flask import Flask, g, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import Config, ensure_private_directories, validate_production_config
-from database import init_app, initialize_database
+from database import database_errors, init_app, initialize_database
 from auth import init_auth
+from admin import init_admin_api
 from documents import init_documents
 from observability import configure_logging
 from web import init_web
@@ -43,6 +42,7 @@ def create_app(test_config=None):
     init_app(app)
     init_auth(app)
     init_documents(app)
+    init_admin_api(app)
     init_web(app)
 
     @app.get("/healthz")
@@ -52,7 +52,7 @@ def create_app(test_config=None):
 
             get_db().execute("SELECT 1").fetchone()
             return jsonify({"status": "ok"}), 200
-        except sqlite3.Error:
+        except database_errors():
             app.logger.exception("health_check_database_unavailable")
             return jsonify({"status": "unavailable"}), 503
 
