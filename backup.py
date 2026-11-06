@@ -20,6 +20,10 @@ STORAGE_KEY_PATTERN = re.compile(r"[0-9a-f]{32}\.(?:pdf|png|jpg|jpeg|txt)\Z")
 
 
 def create_backup(config=Config):
+    if str(config.DATABASE_PATH).startswith(("postgres://", "postgresql://")):
+        raise RuntimeError(
+            "This backup command supports local SQLite only; use PostgreSQL provider backups and object-storage versioning."
+        )
     if Path(config.DATABASE_PATH).is_symlink() or Path(config.UPLOAD_FOLDER).is_symlink():
         raise RuntimeError("Database and upload paths must not be symbolic links.")
     database_path = Path(config.DATABASE_PATH).resolve(strict=True)
