@@ -9,9 +9,9 @@ management routes, file validation, and centralized authorization.
 
 - `schema.sql` defines users, documents, document permissions, and append-only
   audit logs.
-- `database.py` opens caller-owned SQLite connections, enables foreign keys for
-  each connection, sets a bounded busy timeout, supports nested-safe
-  transactions, and initializes schema without dropping data.
+- `database.py` opens caller-owned SQLite or PostgreSQL connections, enables
+  SQLite foreign keys, supports nested-safe transactions, and initializes the
+  selected schema without dropping data.
 - `audit.py` appends canonical UTC-timestamped SHA-256 chained events and
   provides a structured, read-only integrity report.
 - `permissions.py` provides centralized `authorize`, `check_permission`,
@@ -270,17 +270,27 @@ substitute for a dedicated antivirus/malware scanning service.
   State-changing API calls continue to require the session CSRF token; search
   and dashboard reads are non-mutating except for their required audit events.
 
-For production, retain the default Secure, HttpOnly, SameSite=Lax cookie
-settings and serve only over HTTPS. Set `TRUSTVAULT_DATA_DIR` and
-`TRUSTVAULT_UPLOAD_DIR` to private persistent directories. On Render, attach a
-persistent disk before deploying. Gunicorn is configured in `Procfile`.
+For durable production, retain the default Secure, HttpOnly, SameSite=Lax cookie
+settings, serve only over HTTPS, and configure private persistent storage. The
+Vercel setup below uses Neon PostgreSQL and a private Cloudflare R2 bucket.
+Gunicorn is configured in `Procfile` for non-Vercel deployments.
 
-## Render production deployment
+## Render deployment
 
 The Python service has its own Render blueprint at [`render.yaml`](./render.yaml).
 The repository root already has a separate `render.yaml` for the existing
 deployment, so do not replace it. In Render, create a Blueprint from this
 repository and set the Blueprint file path to `TrustVault/render.yaml`.
+
+The checked-in blueprint targets Render's Free plan and does not set
+`TRUSTVAULT_DATA_DIR`; the application uses its default `instance/` directory
+under the service root. Free web-service filesystems are ephemeral, so the
+database, accounts, audit history, and uploaded files can be erased when the
+service restarts, sleeps, or redeploys. Treat this as a temporary demo only and
+do not store important or sensitive documents there. For durable deployment,
+use a plan with persistent-disk support and configure the data directory under
+its mounted disk, or migrate the database and document storage to persistent
+external services.
 
 Deployment-related project layout:
 
@@ -315,21 +325,25 @@ TrustVault/
 ```
 
 The blueprint sets the service root to `TrustVault/`, uses the Gunicorn
-`gthread` worker with one process and four threads, mounts a persistent disk at
-`/var/data`, configures `/healthz`, and keeps exactly one instance. The SQLite
-database, uploads, and local backup snapshots are under
-`/var/data/trustvault`. Do not scale this service horizontally or add worker
-processes without first migrating SQLite and session persistence to shared
-production services.
+`gthread` worker with one process and four threads, configures `/healthz`, and
+keeps exactly one instance. For the Free demo, the SQLite database, uploads,
+and local backup snapshots use the default `instance/` directory under the
+service root. These files are ephemeral on Render Free. Do not scale this
+service horizontally or add worker processes without first migrating SQLite
+and session persistence to shared services.
 
 Deployment steps:
 
-1. Attach the Render persistent disk defined by the blueprint and confirm the
-   service keeps one instance.
-2. Deploy with the blueprint-generated `TRUSTVAULT_SESSION_HASH_KEY`. Keep it
+1. For a Free demo, use the Blueprint as configured and confirm it targets one
+   instance. Remove any manually added `TRUSTVAULT_DATA_DIR` environment
+   variable from the Render service so the app uses its default `instance/`
+   directory.
+2. For durable data, switch to a disk-supported plan, attach a persistent disk,
+   and set `TRUSTVAULT_DATA_DIR` to a directory beneath the disk's mount path.
+3. Deploy with the blueprint-generated `TRUSTVAULT_SESSION_HASH_KEY`. Keep it
    secret and back it up in a secure secret manager.
-3. Confirm `/healthz` reports `{"status":"ok"}` after deployment.
-4. Create an invitation from the Render Shell:
+4. Confirm `/healthz` reports `{"status":"ok"}` after deployment.
+5. Create an invitation from the Render Shell:
 
    ```sh
    python seed.py --create-invite
@@ -337,7 +351,7 @@ Deployment steps:
 
    Deliver the one-time invite out of band. Registration only creates a
    `viewer`; it never accepts a client role.
-5. After the intended first administrator registers, promote that account from
+6. After the intended first administrator registers, promote that account from
    the trusted Render Shell (not through an HTTP endpoint):
 
    ```sh
@@ -348,7 +362,7 @@ Deployment steps:
    audit event. Restrict Render Shell and blueprint access to authorized
    operators. The dashboard is read-only; user role changes are currently
    performed using this audited operational command.
-6. Run the security tests before release:
+7. Run the security tests before release:
 
    ```sh
    python -m pip install -r requirements-dev.txt
@@ -369,10 +383,10 @@ allowlist; Render's `RENDER_EXTERNAL_HOSTNAME` is used when available.
 |---|---|---|
 | `TRUSTVAULT_ENV` | Render: `production`; otherwise `development` | Enables production validation, trusted-proxy handling, and safe exception responses. |
 | `TRUSTVAULT_SESSION_HASH_KEY` | Required in production; generate a random secret of at least 32 bytes | HMAC key for database session-token digests. Never commit or log it. Changing it invalidates existing sessions. |
-| `TRUSTVAULT_DATA_DIR` | Render: `/var/data/trustvault` | Root of persistent database, upload, and backup directories. |
-| `TRUSTVAULT_DATABASE_PATH` | Optional; defaults to `<DATA_DIR>/trustvault.sqlite3` | SQLite database path; must remain on the mounted persistent disk. |
+| `TRUSTVAULT_DATA_DIR` | Optional; defaults to `<TrustVault service root>/instance` | Root of database, upload, and backup directories. Free service storage is ephemeral; for a persistent plan use a directory under the disk mount. |
+| `TRUSTVAULT_DATABASE_PATH` | Optional; defaults to `<DATA_DIR>/trustvault.sqlite3` | SQLite database path; use persistent storage for durable deployment. |
 | `TRUSTVAULT_UPLOAD_DIR` | Optional; defaults to `<DATA_DIR>/uploads` | Private document storage outside Flask's `static/` web root. |
-| `TRUSTVAULT_BACKUP_DIR` | Optional; defaults to `<DATA_DIR>/backups` | Private local snapshot output. Copy completed backups off the Render disk. |
+| `TRUSTVAULT_BACKUP_DIR` | Optional; defaults to `<DATA_DIR>/backups` | Private local snapshot output. Copy completed backups off the service filesystem. |
 | `TRUSTVAULT_COOKIE_SECURE` | `true` in production | Secure cookies are mandatory in production. HttpOnly and SameSite=Lax are always enabled. |
 | `TRUSTVAULT_ALLOWED_HOSTS` | Optional; defaults to Render external hostname | Comma-separated Flask trusted-host allowlist for custom domains. |
 | `TRUSTVAULT_SQLITE_BUSY_TIMEOUT_MS` | `10000` in Render blueprint; otherwise `5000` | How long SQLite waits for a competing writer before returning a busy error. |
@@ -385,14 +399,89 @@ adds pytest and coverage tooling for development and CI. The Gunicorn
 configuration is [gunicorn.conf.py](./gunicorn.conf.py); the Render start
 command and [`Procfile`](./Procfile) use the same factory entry point.
 
+## Vercel deployment (Neon PostgreSQL + Cloudflare R2)
+
+Vercel's function filesystem is ephemeral. This setup stores application
+records and server-side sessions in Neon PostgreSQL, and private document bytes
+in Cloudflare R2. The R2 bucket must remain private; do not enable public
+access or expose object URLs. Vercel serves `api/index.py` through `vercel.json`;
+there is no Gunicorn start command for this deployment.
+
+1. Create a Neon PostgreSQL database and copy its pooled connection string.
+   Keep the URL private. The database role must be allowed to create/alter the
+   TrustVault schema.
+2. Create a private R2 bucket and an R2 API token restricted to that bucket's
+   object read/write permissions. Record the endpoint, bucket name, access key,
+   and secret key.
+3. In Vercel, import the project and set **Root Directory** to `TrustVault/`
+   (the folder containing this README, `requirements.txt`, and `vercel.json`).
+   Use the **Other** framework preset, leave the output directory empty, and
+   do not configure a custom start command; Vercel builds the Python function
+   from `api/index.py` and installs `requirements.txt`.
+   Add these environment variables for Production and Preview only if those
+   environments use separate Neon databases and R2 buckets:
+
+   | Variable | Value |
+   |---|---|
+   | `TRUSTVAULT_ENV` | `production` |
+   | `TRUSTVAULT_SESSION_HASH_KEY` | A fresh random secret of at least 32 bytes. Generate locally with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Do not reuse the key previously used on another host. |
+   | `DATABASE_URL` | Neon PostgreSQL connection string; keep it secret. |
+   | `OBJECT_STORAGE_BUCKET` | Private R2 bucket name. |
+   | `OBJECT_STORAGE_ENDPOINT` | `https://<Cloudflare-account-id>.r2.cloudflarestorage.com` |
+   | `OBJECT_STORAGE_ACCESS_KEY_ID` | R2 API token access key. |
+   | `OBJECT_STORAGE_SECRET_ACCESS_KEY` | R2 API token secret. |
+   | `OBJECT_STORAGE_REGION` | `auto` |
+   | `TRUSTVAULT_COOKIE_SECURE` | `true` |
+
+   Never paste provider credentials into source code, issues, or chat. Rotate
+   the session hash key if it was previously exposed; changing it invalidates
+   existing browser sessions.
+4. Before directing users to the Vercel deployment, stop writes to the old
+   instance, set the same database/R2 variables in a trusted local PowerShell
+   session, and run the verified data copy:
+
+   ```powershell
+   python migrate_to_vercel_storage.py --sqlite-path instance\trustvault.sqlite3 --upload-path instance\uploads --execute
+   ```
+
+   The command checks SQLite integrity and the audit chain, verifies every
+   live document's size and SHA-256 digest, refuses to overwrite a non-empty
+   PostgreSQL database, and copies active document objects to R2. It does not
+   delete the source SQLite database or uploads. If you have not used the
+   default local paths, provide their actual locations. Keep the old instance
+   read-only until the Vercel deployment passes health and login checks.
+5. Deploy from Vercel. The app creates missing PostgreSQL schema objects on
+   startup; `/healthz` should return `{"status":"ok"}`. From a trusted local
+   terminal configured with the same provider environment variables, create an
+   invitation and provision the initial administrator:
+
+   ```powershell
+   python seed.py --create-invite
+   python provision_role.py --email admin@example.com --role administrator
+   ```
+
+   Keep the invite token private and deliver it only to its intended user.
+6. Configure Neon backups and R2 object versioning/retention separately.
+   `backup.py` creates SQLite/local-filesystem backups and is not a backup
+   procedure for the Vercel storage configuration.
+
+Required Vercel keys are validated at startup. `DATABASE_URL` selects
+PostgreSQL; the four required `OBJECT_STORAGE_*` values select private S3
+compatible storage. Without those provider settings, the app continues to use
+the local SQLite and private filesystem configuration for development and
+Render deployments.
+
 ### Persistence, backups, and recovery
 
-Container filesystems are ephemeral. Only the mounted Render disk is treated
-as persistent by this configuration. `database.py` enables SQLite WAL mode,
-foreign keys, a bounded busy timeout, and `synchronous=FULL`; the database
-directory is private and the database file is restricted to owner access on
-POSIX systems. The upload directory is private, not served by Flask static
-routes, and stores UUID-named files.
+Container filesystems are ephemeral. The current Free-tier blueprint stores
+everything under the default `instance/` directory; those files can disappear
+at any time and must not be treated as backups or durable data. For a disk-supported plan,
+mount a persistent disk and place the database, uploads, and backup directory
+under its mount path. `database.py` enables SQLite WAL mode, foreign keys, a
+bounded busy timeout, and `synchronous=FULL`; the database directory is
+private and the database file is restricted to owner access on POSIX systems.
+The upload directory is private, not served by Flask static routes, and stores
+UUID-named files.
 
 Create a paired SQLite online snapshot and archive of all live referenced
 uploads during a maintenance window with writes stopped:
