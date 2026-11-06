@@ -163,6 +163,8 @@ def record_audit(
     event_id = _event_id or new_id()
 
     with transaction(connection):
+        if getattr(connection, "is_postgres", False):
+            connection.execute("SELECT pg_advisory_xact_lock(73510422)")
         if user_id is not None and username is None:
             actor = connection.execute(
                 "SELECT email FROM users WHERE id = ?", (user_id,)
