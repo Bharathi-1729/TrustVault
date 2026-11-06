@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: trustvault-python
+    runtime: python
+    rootDir: TrustVault
+    plan: starter
+    region: oregon
+    numInstances: 1
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --config gunicorn.conf.py "app:create_app()"
+    healthCheckPath: /healthz
+    envVars:
+      - key: TRUSTVAULT_ENV
+        value: production
+      - key: TRUSTVAULT_DATA_DIR
+        value: /var/data/trustvault
+      - key: TRUSTVAULT_SESSION_HASH_KEY
+        generateValue: true
+      - key: TRUSTVAULT_COOKIE_SECURE
+        value: "true"
+      - key: TRUSTVAULT_SQLITE_BUSY_TIMEOUT_MS
+        value: "10000"
+    disk:
+      name: trustvault-python-data
+      mountPath: /var/data
+      sizeGB: 10

@@ -23,16 +23,13 @@ management routes, file validation, and centralized authorization.
 - `auth.py` provides invite-controlled registration, Werkzeug password hashes,
   generic login errors, SQLite-backed sessions, CSRF validation, account-status
   checks, and IP/normalized-email login throttling.
-- `mfa.py` provides Administrator-only TOTP login challenges and encrypts
-  authenticator secrets with a key derived from the stable session hash key.
 - `security.py` provides allowlists, normalization, opaque IDs, and token
   hashing.
 
 ### Tables and constraints
 
 - **users** stores opaque IDs, normalized unique emails, names, Werkzeug hash
-  slots, constrained roles/status, encrypted optional TOTP secrets, a replay
-  counter, an auth-version counter, and UTC timestamps.
+  slots, constrained roles/status, an auth-version counter, and UTC timestamps.
   `status` is the authoritative account state; authentication derives
   `is_active` from it to avoid duplicate state.
 - **registration_invites** stores only a SHA-256 digest of a single-use,
@@ -79,8 +76,6 @@ management routes, file validation, and centralized authorization.
   SQL mutations.
 - Schema creation runs inside `BEGIN IMMEDIATE` and only uses
   `CREATE ... IF NOT EXISTS`, so rerunning initialization does not erase data.
-  The optional Administrator MFA fields are added with non-destructive
-  `ALTER TABLE` statements for existing databases.
   Each connection enables foreign keys and a bounded busy timeout. Nested
   transactions use savepoints.
 - Timestamps are ISO-8601 UTC strings ending in `Z`; the database enforces the
@@ -103,27 +98,6 @@ corruption; it never silently repairs or rehashes damaged history.
 When startup encounters the prior audit schema, migration first validates its
 entire legacy chain and creates a SQLite online-backup copy beside the database
 before changing the table. Corrupted legacy history aborts without migration.
-
-### Administrator two-step verification
-
-Administrators must sign in with their password and a six-digit code from an
-authenticator app. Codes expire on a 30-second time step, allow one adjacent
-time step for clock drift, are rate limited with password failures, and cannot
-be reused. MFA secrets are encrypted in SQLite. Keep
-`TRUSTVAULT_SESSION_HASH_KEY` stable across restarts and backups; changing it
-requires reprovisioning MFA secrets as well as invalidating sessions.
-
-When an account is promoted to Administrator from the trusted console, the
-provisioning command displays the authenticator setup URI and setup key once.
-Save them in an authenticator app before closing the terminal. An
-Administrator registration invite similarly displays the setup key once after
-successful registration. If setup is lost, the trusted operator can demote and
-reprovision the account, which invalidates existing sessions and rotates the
-MFA secret.
-
-```sh
-python provision_role.py --email "existing-account@example.com" --role administrator
-```
 
 ## Tests
 
@@ -195,42 +169,17 @@ python seed.py --create-invite
 ```
 
 This initializes the schema without deleting records and prints a one-time
-Viewer registration invite. No default user or password is created. Use that
-invite to create the initial account at `/register`. To bootstrap the first
-administrator, use `provision_role.py` from trusted console access. Afterward,
-administrators can generate single-use registration links for Viewer, Document
-Owner, or Administrator from the role-invite popup on the admin dashboard.
-Opening a link supplies its invite automatically; the role is assigned during
-registration, while client-supplied roles and user IDs are ignored. Share
-links securely and do not put them in logs. Existing users should use the email
-and password they set during registration; the application intentionally has
-no default credentials. User and audit activity remains restricted to the
-authenticated administrator dashboard.
+registration invite. No default user or password is created. Registration
+requires the invite and creates a `viewer`; client-supplied roles and user IDs
+are ignored. Use a securely delivered invitation and do not put it in logs.
+Open `/register` in the browser, enter the invite with your account details,
+then sign in at `/login`. Existing users should use the email and password
+they set during registration; the application intentionally has no default
+credentials. The registration page describes Viewer, Document Owner, and
+Administrator capabilities without accepting role selections. User and audit
+activity remains restricted to the authenticated administrator dashboard.
 Authenticated users can view their account details at `/profile` and sign out
 using the CSRF-protected navigation control.
-
-## Administrator control dashboard
-
-Administrators sign in through `/login` and are sent to `/admin`. The dashboard
-provides live, paginated views for users, document metadata, document access,
-permissions, shares, audit activity, and SQLite-backed summary reports. User
-role/status changes require CSRF-protected administrator APIs, are recorded in
-the append-only audit chain, and increment the target's authentication version
-so role changes and account disabling take effect on the next request.
-
-The JSON endpoints are under `/api/admin`: `dashboard`, `users`,
-`users/<id>`, `users/<id>/documents`, `users/<id>/activity`, `documents`,
-`documents/<id>/access`, `documents/<id>/permissions`,
-`documents/<id>/permission-history`, `permissions`, `shares`, `activity`,
-`audit-logs`, and `reports`. `PATCH /api/admin/users/<id>/role` and
-`PATCH /api/admin/users/<id>/status` manage accounts. Every endpoint requires
-an active administrator; changes also require the normal CSRF header.
-
-The dashboard only exposes document metadata and access-control history. It
-does not grant administrators access to private file contents. The existing
-schema has no document-version table or version-replacement service, so file
-version replacement is not offered. Reports use accessible native bar charts
-and do not load a third-party chart script.
 
 For local HTTP development in PowerShell, turn off the Secure-cookie flag only
 for that local process, then start Flask on port 5003 (the workspace task uses
@@ -241,8 +190,8 @@ $env:TRUSTVAULT_COOKIE_SECURE = "false"
 python -m flask --app "app:create_app()" run --host 127.0.0.1 --port 5003
 ```
 
-For the first local account, use a Viewer invite from a second terminal in the
-same `TrustVault` folder:
+In a second terminal, from the same `TrustVault` folder, generate an invite
+using the same data-directory environment:
 
 ```powershell
 $env:TRUSTVAULT_COOKIE_SECURE = "false"
@@ -395,13 +344,10 @@ Deployment steps:
    python provision_role.py --email admin@example.com --role administrator
    ```
 
-   The command updates the role transactionally, appends an audit event, and
-   prints a one-time authenticator setup URI and manual key. Add the account to
-   an authenticator app and store the setup key securely before closing the
-   Render Shell; it cannot be retrieved from the database later. Administrator
-   login requires this authenticator code. Restrict Render Shell and blueprint
-   access to authorized operators. The dashboard is read-only; user role
-   changes are currently performed using this audited operational command.
+   This console-only operation updates the role transactionally and appends an
+   audit event. Restrict Render Shell and blueprint access to authorized
+   operators. The dashboard is read-only; user role changes are currently
+   performed using this audited operational command.
 6. Run the security tests before release:
 
    ```sh
