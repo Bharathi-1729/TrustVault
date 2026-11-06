@@ -1,3 +1,67 @@
+# TrustVault on Netlify
+
+The deployed app uses the existing browser interface in `public/` and the
+`netlify/functions/trustvault.mjs` handler for pages and API requests. Accounts,
+revocable sessions, invitations, document permissions, metadata, and audit events
+use Netlify Database with Drizzle. Private document bytes use Netlify Blobs and
+are served only after an authenticated permission check.
+
+## Deployment
+
+Deploy this repository with `netlify.toml`. The base is the repository root,
+the publish directory is `public`, and Functions are in `netlify/functions`.
+For a manual preview deployment, use `npm run deploy:preview`. This selects
+`trustvau` explicitly instead of depending on automatic project discovery. If
+an external deploy runner reports “Project not found” despite a valid link,
+configure that runner to pass `--site trustvau` and verify its project access.
+Changing repository files does not change the runner’s command or credentials.
+
+No application build command is needed. Database migrations under
+`netlify/database/migrations` are applied automatically during deployment.
+Do not run migrations manually. This Netlify app needs no Supabase credentials
+or custom session signing key.
+
+After the first deployment has applied the database migrations, create the
+initial administrator from a trusted terminal linked to this Netlify project:
+
+```sh
+netlify dev:exec --context production npm run create-admin -- admin@example.com "Your name"
+```
+
+Replace the example account details. The command prompts twice for a password
+with input hidden; it never prints or writes the password to a file. It refuses
+to create another initial administrator once one exists. Ensure the selected
+Netlify context targets the intended database. Use `--context deploy-preview`
+instead when preparing a preview administrator. This is a trusted CLI operation;
+there is no public first-user registration or setup endpoint.
+
+Sign in at `/login`, open `/admin`, and create invitations for document owners,
+viewers, or additional administrators. Recipients register at `/register` with
+their invitation. Uploads are limited to 4 MB and supported PDF, PNG, JPEG, and
+text documents. Passwords require at least 12 characters and at most 72 UTF-8
+bytes. Existing Supabase data is not copied by this fresh-database setup.
+Production and preview file namespaces are separate; copied production metadata
+in a preview does not grant access to production file bytes.
+
+Run `npm ci` and `npm test` to install dependencies and check routes, session and
+permission behavior, transactional registration, audit appends, and SQL parameter
+binding. The tests use a simulated SQL driver and private file store; they do not
+apply migrations or substitute for a deployed database and storage smoke check.
+After deploying, `/healthz` checks database access, and login, upload, sharing,
+revocation, and download can be verified with the invited accounts.
+
+## Schema changes
+
+Update `db/schema.ts`, then generate a descriptively named migration with
+`npx drizzle-kit generate --name add_descriptive_change`. Drizzle packages are
+pinned to the beta versions required by the Netlify Database adapter. Keep the
+append-only audit protection migration with the generated schema migration.
+
+The Python/Flask and Vercel instructions below describe the legacy application
+and are not used by the Netlify deployment.
+
+---
+
 # TrustVault Python application
 
 This directory is an additive Python/Flask foundation. The existing project at

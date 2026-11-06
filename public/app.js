@@ -111,9 +111,9 @@ function renderRegister() {
         <label for="invite">Invitation token</label>
         <input id="invite" name="invite_token" autocomplete="off" required>
         <label for="register-password">Password</label>
-        <input id="register-password" name="password" type="password" minlength="12" maxlength="1024" required>
+        <input id="register-password" name="password" type="password" minlength="12" maxlength="72" required>
         <label for="confirm-password">Confirm password</label>
-        <input id="confirm-password" name="password_confirm" type="password" minlength="12" maxlength="1024" required>
+        <input id="confirm-password" name="password_confirm" type="password" minlength="12" maxlength="72" required>
         <button type="submit">Register</button>
         <p class="form-message" data-message role="status" aria-live="polite"></p>
       </form>
@@ -428,7 +428,7 @@ async function start() {
   } catch (error) {
     currentUser = null;
     if (error.status !== 401) {
-      startupNotice = "Authentication service is unavailable. Check the Supabase environment variables and database setup.";
+      startupNotice = "Sign-in is temporarily unavailable. Please try again shortly.";
     }
   }
   renderNavigation();
